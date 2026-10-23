@@ -1,0 +1,64 @@
+# Host tests on Linux and macOS, the conformance harness, and the ESP-IDF example's build. GitHub-hosted runners only,
+# no secrets, read-only token, no artifacts: a fork's pull request runs here with nothing to take.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test/test.sh
+
+  # shortcut: macOS only on pushes to main, since a private repo's macOS minutes cost 10x; run it on every pull request
+  # once the repository is public.
+  host-tests-macos:
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test/test.sh
+
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: harness/harness.sh up
+      - run: TSNET_HARNESS=1 test/test.sh
+      - if: always()
+        run: harness/harness.sh down
+
+  esp-idf-example:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: espressif/idf:v5.5.6@sha256:bf72fe7a15c22849a9a94147301165a545fb8905d97c176cf748e3e4614cac84
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build examples/esp-idf
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C examples/esp-idf build

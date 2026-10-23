@@ -1,0 +1,15 @@
+version: "0.1.0"
+description: "A Tailscale node for ESP-IDF, in C: control, DERP, disco, WireGuard and a packet filter, behind lwIP"
+url: "https://github.com/mlevit/tailscale-embedded"
+license: "MIT"
+targets:
+  - esp32p4
+dependencies:
+  idf: ">=5.5"
+files:
+  exclude:
+    - "harness/**"
+    - "test/**"
+    - "tools/**"
+    - "examples/**"
+    - ".github/**"

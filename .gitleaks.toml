@@ -1,0 +1,9 @@
+# gitleaks: the default rules, less two kinds of false positive.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Tailscale public keys in text form (test vectors, the harness's throwaway nodes); vendored xxhash constants"
+regexTarget = "match"
+regexes = ['''(nodekey|mkey|discokey|nlpub):[0-9a-fA-F]{64}''']
+paths = ['''third_party/zstd/lib/common/xxhash\.h''']

@@ -1,0 +1,21 @@
+menu "tailscale-embedded example"
+
+    config EXAMPLE_CONTROL_URL
+        string "Control server URL"
+        default "https://controlplane.tailscale.com"
+        help
+            Tailscale's control server, or your headscale's URL.
+
+    config EXAMPLE_HOSTNAME
+        string "Node hostname"
+        default "esp32p4"
+
+    config EXAMPLE_AUTH_KEY
+        string "Auth key (empty: log in by URL)"
+        default ""
+        help
+            A pre-auth key registers the node at its first start. After that the stored node key logs it in. The key
+            ends up in sdkconfig and in the firmware image: never commit sdkconfig, and treat the image as a secret.
+            Empty, the node logs a URL to visit instead.
+
+endmenu

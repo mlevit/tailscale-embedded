@@ -1,0 +1,41 @@
+# The harness's DERP map: one region, served by headscale's embedded DERP server (Tailscale's own derpserver).
+# The same server is listed twice because the two sides reach it at different addresses: tsnet on the Mac at
+# 127.0.0.1:8090 (the published port), the tailscaled peer at 172.30.90.10:8080 (the harness network). derphttp's
+# dialRegion tries the nodes in order, and each side takes the one it can reach. headscale shuffles a region's nodes
+# (shuffleDERPMap, seeded by dns.base_domain), so both sides get 900b first today: the peer takes it, and on the Mac
+# its dial times out after derphttp's 1.5 s and 900a is taken, which also checks that timeout against the real server.
+# Both speak plain HTTP (TS_DEBUG_USE_DERP_HTTP). STUN is the same: 127.0.0.1:3478 is headscale's STUN port published
+# for the Mac, 172.30.90.10:3478 is the peer's; netcheck's tries cycle through a region's nodes.
+regions:
+  900:
+    regionid: 900
+    regioncode: harness
+    regionname: tsnet harness
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: 127.0.0.1
+        derpport: 8090
+        stunport: 3478 # the published STUN port
+      - name: 900b
+        regionid: 900
+        hostname: 172.30.90.10
+        derpport: 8080
+        stunport: 3478
+  # A second region, the same server again, so a node has a region that isn't its home: a packet sent there opens a
+  # connection that cleanStaleDerp closes after 60 s idle.
+  901:
+    regionid: 901
+    regioncode: harness2
+    regionname: tsnet harness two
+    nodes:
+      - name: 901a
+        regionid: 901
+        hostname: 127.0.0.1
+        derpport: 8090
+        stunport: 3478
+      - name: 901b
+        regionid: 901
+        hostname: 172.30.90.10
+        derpport: 8080
+        stunport: 3478

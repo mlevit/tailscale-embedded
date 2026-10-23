@@ -1,0 +1,6 @@
+# sdkconfig holds the auth key once you set one in menuconfig, and build/ holds images built with it.
+sdkconfig
+sdkconfig.old
+build/
+managed_components/
+dependencies.lock

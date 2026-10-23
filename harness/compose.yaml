@@ -1,0 +1,62 @@
+# tsnet's conformance harness: a headscale control server and a real tailscaled peer, on this machine only.
+# Driven by harness.sh (up, key, the scenario hooks, down); see README.md. Not a stack: nothing here deploys, and it holds
+# no secret beyond the throwaway preauth keys harness.sh mints into it.
+#
+# Images pinned by tag and digest, each release checked first (notes, advisories, at least 7 days old, a scan):
+# headscale v0.29.5 (2026-10-13, the newest release), tailscale v1.104.1 (2026-10-07; v1.104.2 is under 7 days old and
+# its one security fix, TS-2026-013's TLS intermediates, doesn't reach a peer that talks plain HTTP to a local server).
+name: tsnet-harness
+
+services:
+  headscale:
+    image: headscale/headscale:v0.29.5@sha256:780ed2f9e85719a2211277433f2c8afb45105d0d25031949a6848a485f9e216d
+    container_name: tsnet-harness-headscale
+    command: serve
+    volumes:
+      - ./headscale.yaml:/etc/headscale/config.yaml:ro
+      - ./derp.yaml:/etc/headscale/derp.yaml:ro
+      - headscale:/var/lib/headscale
+    ports:
+      - "127.0.0.1:8090:8080"
+      - "127.0.0.1:3478:3478/udp" # STUN, for tsnet's netcheck on the Mac (derp.yaml's Mac-side nodes)
+    networks:
+      harness:
+        ipv4_address: 172.30.90.10
+    restart: "no"
+
+  # A real Tailscale node, joined with a key harness.sh mints. Userspace networking: no NET_ADMIN, no tun device.
+  # It logs in by headscale's private IP, not its name: for an http:// URL on a private address ts2021 never tries
+  # HTTPS (NewClient), whereas with a hostname a retry within 2 minutes of a dial is forced to port 443
+  # (controlhttp forceNoise443, health LastNoiseDialWasRecent), where nothing listens here, and the peer never rejoins.
+  peer:
+    image: tailscale/tailscale:v1.104.1@sha256:87c55d6be56ad85b3d8bceca5f87f73de288c609131460dd1be1874c250cc41d
+    container_name: tsnet-harness-peer
+    environment:
+      TS_AUTHKEY: ${PEER_AUTHKEY:-}
+      TS_EXTRA_ARGS: --login-server=http://172.30.90.10:8080
+      TS_HOSTNAME: tsnet-peer
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      # --verbose=1 and TS_DEBUG_NOISE_DIAL: the [v1] lines and every control dial in the log, which is how the harness
+      # shows what the official client does (docker logs tsnet-harness-peer).
+      TS_TAILSCALED_EXTRA_ARGS: --port=${PEER_PORT:-41641} --verbose=1
+      TS_DEBUG_NOISE_DIAL: "true"
+      # The harness's DERP server speaks plain HTTP (derp.yaml); this is Go's own knob for that (derphttp useHTTPS).
+      TS_DEBUG_USE_DERP_HTTP: "true"
+    volumes:
+      - peer:/var/lib/tailscale
+    networks:
+      - harness
+    depends_on:
+      - headscale
+    restart: "no"
+
+networks:
+  harness:
+    ipam:
+      config:
+        - subnet: 172.30.90.0/24 # clear of Docker's default networks
+
+volumes:
+  headscale:
+  peer:

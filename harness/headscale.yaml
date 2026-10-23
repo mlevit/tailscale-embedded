@@ -1,0 +1,64 @@
+# headscale for tsnet's harness, from v0.29.5's config-example.yaml with only these changes: the URL tsnet
+# reaches it on from the host, listening on all of the container's addresses, no update checks, no DNS takeover, and
+# the embedded DERP server with the harness's own DERP map (derp.yaml) in place of Tailscale's public one, so
+# nothing in the harness uses Tailscale's DERP servers. The DERP server runs over plain HTTP here: the example config
+# says it needs https, but headscale doesn't check that, and both clients use TS_DEBUG_USE_DERP_HTTP. The policy is in
+# the database: scenario 11 changes it at runtime with `headscale policy set`. Until a policy is set, all nodes
+# reach each other, as with the example's empty file path.
+server_url: http://127.0.0.1:8090
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: true
+    region_id: 900
+    region_code: harness
+    region_name: tsnet harness
+    verify_clients: true
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: false
+  urls: []
+  paths:
+    - /etc/headscale/derp.yaml
+  auto_update_enabled: false
+  update_frequency: 3h
+disable_check_updates: true
+node:
+  expiry: 0
+  ephemeral:
+    inactivity_timeout: 30m
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+log:
+  level: info
+  format: text
+policy:
+  mode: database
+  path: ""
+dns:
+  magic_dns: true
+  base_domain: tsnet.test
+  override_local_dns: false
+  nameservers:
+    global: []
+    split: {}
+  search_domains: []
+  extra_records: []
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
+taildrop:
+  enabled: false
