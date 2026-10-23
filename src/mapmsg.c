@@ -154,7 +154,9 @@ int tsnet_mapmsg_feed(tsnet_mapmsg_t *m, const uint8_t *data, size_t len, tsnet_
             m->dead = true;
             break;
         }
-        memcpy(m->msg + m->have, data + i, take);
+        if (take > 0) { // an empty message leaves m->msg NULL, and memcpy's pointers may not be NULL (glibc's nonnull)
+            memcpy(m->msg + m->have, data + i, take);
+        }
         m->have += take;
         i += take;
         if (m->have == m->want) {

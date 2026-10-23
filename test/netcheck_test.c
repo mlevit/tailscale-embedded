@@ -194,9 +194,13 @@ int main(void)
     EXPECT(run(nc, 6000));
     uint64_t took_enough = tsnet_now_ms() - t_enough;
     EXPECT(servers[0].requests == 3); // the retries went before the first answer
-    // Never early, and ended by the timer, not by the 3 s STUN timeout. Real time on a loaded CI runner went past a
-    // 1300 ms bound, so this no longer tells the timer's 1.2 s from a retry-moved 1.3 or 1.4 s.
-    EXPECT(took_enough >= 1200 && took_enough < 2900);
+    // Never early, and ended by the timer, not by the 3 s STUN timeout. The timer runs 2 × the slowest of the 3
+    // latencies (region 1's) after that answer, so the report takes at least 3 × it. The server's delay is in whole
+    // milliseconds, so the answer can come at 399.x ms (a GitHub runner did): the bound is the latency measured, less 1
+    // ms for now_ms's truncation, not a fixed 1200. Real time on a loaded runner went past 1300 ms, so the top
+    // is only the 3 s timeout.
+    uint32_t l1_enough = tsnet_nc_latency(&tsnet_netcheck_report(nc)->base, 1) / 1000; // ms
+    EXPECT(l1_enough >= 390 && took_enough + 1 >= 3 * (uint64_t)l1_enough && took_enough < 2900);
     servers[0].delay_ms = 60;
 
     // UDP blocked: no answer, so STUN gives up after 3 s and HTTPS is tried (and fails here); no latency, no UDP.

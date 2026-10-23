@@ -423,7 +423,9 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
 
 ## Testing
 
-`test/test.sh` builds the core with the host back end and runs the tests under ASan and UBSan. It links mbedTLS, cJSON and lwIP: ESP-IDF's own copies when `IDF_PATH` is set, else the pinned releases
+`test/test.sh` builds the core with the host back end and runs the tests under ASan and UBSan. A UBSan report stops
+the test (`-fno-sanitize-recover`); glibc's `nonnull` makes `memcpy(p, NULL, 0)` one, which macOS doesn't report, so
+guard a copy that can be empty. The core is compiled once, in parallel, and each test links it. It links mbedTLS, cJSON and lwIP: ESP-IDF's own copies when `IDF_PATH` is set, else the pinned releases
 `tools/fetch_deps.sh` downloads and checks (sha256), into `$TSNET_HOST_BUILD` (default `~/.cache/tailscale-embedded`).
 lwIP is built with NO_SYS and the options in `test/lwip/lwipopts.h`. lwIP keeps one stack a process, so only one node in a test has one.
 

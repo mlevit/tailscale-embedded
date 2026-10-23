@@ -61,21 +61,33 @@ for f in "$LWIP"/core/{init,def,inet_chksum,ip,mem,memp,netif,pbuf,raw,stats,sys
   cc -O1 -w -fsanitize=address,undefined "${LWIP_INC[@]}" -I "$TSNET/src" -c "$f" -o "$o"
   lwip_objs+=("$o")
 done
+# UBSan stops the test at its first report: by default it prints and goes on, and two reports passed unnoticed.
+CFLAGS=(-std=c11 -Wall -Wextra -Werror -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=undefined
+  -DZSTD_DISABLE_ASM=1 -I "$TSNET/src" -I "$TSNET/test"
+  -I "$MBEDTLS/include" -I "$CJSON" -I "$ZSTD" -I "$MONO" -I "$MONO/optional" -I "$NACL" "${LWIP_INC[@]}")
 CORE=("$TSNET/src/crypto.c" "$TSNET/src/blake2s.c" "$TSNET/src/noise.c" "$TSNET/src/http1.c" "$TSNET/src/tls.c"
   "$TSNET/src/controlhttp.c" "$TSNET/src/controlkey.c" "$TSNET/src/hpack.c" "$TSNET/src/h2.c" "$TSNET/src/tailcfg.c"
   "$TSNET/src/mapresp.c" "$TSNET/src/mapmsg.c" "$TSNET/src/netmap.c" "$TSNET/src/identity.c" "$TSNET/src/policy.c"
   "$TSNET/src/client.c" "$TSNET/src/derp.c" "$TSNET/src/derphttp.c" "$TSNET/src/derpmgr.c" "$TSNET/src/stun.c"
   "$TSNET/src/ncplan.c" "$TSNET/src/netcheck.c" "$TSNET/src/magicsock.c" "$TSNET/src/disco.c" "$TSNET/src/endpoint.c" "$TSNET/src/selfeps.c" "$TSNET/src/wg.c" "$TSNET/src/wgdev.c" "$TSNET/src/allowedips.c" "$TSNET/src/tun.c" "$TSNET/src/filter.c" "$TSNET/src/server.c" "$TSNET/src/json.c"
   "$TSNET/platform/host/platform_host.c"
-  "$TSNET/platform/net_posix.c"
-  "$out/cJSON.o" "${zstd_objs[@]}" "$out/monocypher.o" "$out/monocypher-ed25519.o" "$out/tweetnacl.o" "${lwip_objs[@]}")
+  "$TSNET/platform/net_posix.c")
 TESTS=(crypto_test noise_test http1_test controlkey_test controlhttp_test hpack_test h2_test tailcfg_test mapmsg_test
   netmap_test identity_test policy_test derp_test derphttp_test derpmgr_test stun_test ncplan_test netcheck_test magicsock_test disco_test endpoint_test selfeps_test wg_test wgdev_test wgnode_test allowedips_test tun_test filter_test json_test fuzz_test)
-for t in "${TESTS[@]}" probe capture client_run derp_run derp_probe derpmgr_run magicsock_run; do
-  cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -DZSTD_DISABLE_ASM=1 -I "$TSNET/src" -I "$TSNET/test" \
-    -I "$MBEDTLS/include" -I "$CJSON" -I "$ZSTD" -I "$MONO" -I "$MONO/optional" -I "$NACL" "${LWIP_INC[@]}" "$TSNET/test/$t.c" \
-    "${CORE[@]}" "$lib" -lm -o "$out/$t"
-done
+TOOLS=(probe capture client_run derp_run derp_probe derpmgr_run magicsock_run)
+# tsnet's sources are compiled once, 8 at a time, and every binary links the objects: compiling all of them into each
+# of the 37 binaries took most of the run. The inner scripts are single-quoted on purpose: they get their paths and
+# flags as arguments.
+mkdir "$out/core"
+# shellcheck disable=SC2016
+printf '%s\0' "${CORE[@]}" |
+  xargs -0 -P 8 -I{} sh -c 'f="$1" d="$2"; shift 2; cc "$@" -c "$f" -o "$d/$(basename "$f" .c).o"' _ {} "$out/core" "${CFLAGS[@]}"
+LINK=("$out"/core/*.o "$out/cJSON.o" "${zstd_objs[@]}" "$out/monocypher.o" "$out/monocypher-ed25519.o" "$out/tweetnacl.o"
+  "${lwip_objs[@]}" "$lib" -lm)
+# shellcheck disable=SC2016
+printf '%s\0' "${TESTS[@]}" "${TOOLS[@]}" |
+  xargs -0 -P 8 -I{} sh -c 't="$1" s="$2" d="$3"; shift 3; cc "$s/$t.c" "$@" -o "$d/$t"' _ {} "$TSNET/test" "$out" \
+    "${CFLAGS[@]}" "${LINK[@]}"
 for t in "${TESTS[@]}"; do
   if [ "$t" = h2_test ] || [ "$t" = derp_test ] || [ "$t" = fuzz_test ]; then
     TSNET_LOG_QUIET=1 "$out/$t" # their garbage rounds log thousands of errors on purpose

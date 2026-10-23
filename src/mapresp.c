@@ -454,7 +454,9 @@ tsnet_derp_map_t *tsnet_derp_map_copy(const tsnet_derp_map_t *src)
         tsnet_derp_map_free(dm);
         return NULL;
     }
-    memcpy(dm->region_score, src->region_score, src->n_region_score * sizeof *dm->region_score);
+    if (src->n_region_score > 0) { // memcpy's source may not be NULL even for 0 bytes (glibc's nonnull)
+        memcpy(dm->region_score, src->region_score, src->n_region_score * sizeof *dm->region_score);
+    }
     dm->n_region_score = src->n_region_score;
     for (size_t i = 0; i < src->n_regions; i++) {
         tsnet_derp_region_t *r = &dm->regions[i];
