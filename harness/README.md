@@ -67,7 +67,9 @@ real implementations without touching the tailnet. `harness.sh` drives it:
   9. **udp-blocked:** the same with its STUN packets dropped: no UDP, HTTPS tried (and refused by the plain-HTTP
      DERP, as Go's TLS-only check would be), no latency, and the home is the fallback's, connected.
   10. **disco:** `magicsock_run` with `TSNET_PING=tsnet-peer` disco-pings the peer every 2 s, as `tailscale
-      ping` does. The first answer comes over DERP; tsnet sends a CallMeMaybe, and the path goes direct to one of the
+      ping` does. tsnet pings the peer's endpoints and DERP together, and the first answer wins. On a Mac (OrbStack)
+      the host can't reach a container's address, so DERP answers first. On plain Linux Docker, such as GitHub's
+      runners, the direct path answers first and no CallMeMaybe is needed. When DERP is first, tsnet sends a CallMeMaybe, and the path goes direct to one of the
       peer's endpoints: its own port 41641, or the port its NAT maps, whichever this machine's network reaches (a hand
       run took the first, CI the second). The peer's own `tailscale ping` gets a direct answer from tsnet
       (counted, not printed: it names this Mac's address). Then the peer moves to port 41642 (`peer-port`) with a new

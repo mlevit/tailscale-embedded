@@ -290,40 +290,52 @@ direct_port() { tail -n +"$(($1 + 1))" "$log" | grep -oE "pong from tsnet-peer v
 log="$logs/disco"
 "$H" delete tsnet-disco
 ok=0
-why="no answer over DERP"
+why="no answer from the peer, over DERP or direct"
 peer_direct=0
 TSNET_STATE_DIR="$disco" TSNET_HOSTNAME=tsnet-disco TS_DEBUG_USE_DERP_HTTP=1 TSNET_PING=tsnet-peer "$MS" "$URL" 100 \
   "$key" >"$log" 2>&1 &
 pids+=($!)
-if wait_log "$log" 0 30 "pong from tsnet-peer via derp-90[01]"; then
-  why="no CallMeMaybe to the peer"
-  if wait_log "$log" 0 10 "sent call-me-maybe to"; then
-    why="no direct path to the peer"
-    if wait_log "$log" 0 20 "pong from tsnet-peer via udp port [0-9]+ "; then
-      old_port="$(direct_port 0)"
-      why="the peer's tailscale ping wasn't answered over a direct path"
-      # Counted, not printed: a direct pong names this Mac's address.
-      peer_direct="$(docker exec tsnet-harness-peer tailscale ping -c 5 --timeout 3s tsnet-disco 2>&1 |
-        grep -cE "^pong from tsnet-disco .* via [0-9a-f.:\[]+:[0-9]+ in" || true)"
-      if [ "$peer_direct" -ge 1 ]; then
-        from="$(lines "$log")"
-        "$H" peer-port 41642
-        why="the peer's new disco key wasn't noticed"
-        if wait_log "$log" "$from" 60 "changed its disco key"; then
-          why="the path didn't follow the peer to a new port (it used port $old_port before)"
-          for _ in $(seq 30); do
-            new_port="$(direct_port "$from")"
-            if [ -n "$new_port" ] && [ "$new_port" != "$old_port" ]; then
-              ok=1
-              break
-            fi
-            sleep 1
-          done
-        fi
+if wait_log "$log" 0 30 "pong from tsnet-peer via (derp-90[01]|udp port [0-9]+ )"; then
+  # tsnet pings the peer's netmap endpoints and DERP at once (endpoint.send), and the first answer wins. On this Mac
+  # (OrbStack) the host can't reach a container's address, so DERP answers first and the CallMeMaybe makes the path
+  # direct. On plain Linux Docker (GitHub's runners) the direct answer comes first, and no CallMeMaybe is needed.
+  first="$(grep -m1 -oE "pong from tsnet-peer via (derp|udp)" "$log" | grep -oE "(derp|udp)$" || true)"
+  direct=1
+  if [ "$first" = derp ]; then
+    direct=0
+    why="no CallMeMaybe to the peer"
+    if wait_log "$log" 0 10 "sent call-me-maybe to"; then
+      why="no direct path to the peer"
+      if wait_log "$log" 0 20 "pong from tsnet-peer via udp port [0-9]+ "; then
+        direct=1
+      fi
+    fi
+  fi
+  if [ "$direct" = 1 ]; then
+    old_port="$(direct_port 0)"
+    why="the peer's tailscale ping wasn't answered over a direct path"
+    # Counted, not printed: a direct pong names this Mac's address.
+    peer_direct="$(docker exec tsnet-harness-peer tailscale ping -c 5 --timeout 3s tsnet-disco 2>&1 |
+      grep -cE "^pong from tsnet-disco .* via [0-9a-f.:\[]+:[0-9]+ in" || true)"
+    if [ "$peer_direct" -ge 1 ]; then
+      from="$(lines "$log")"
+      "$H" peer-port 41642
+      why="the peer's new disco key wasn't noticed"
+      if wait_log "$log" "$from" 60 "changed its disco key"; then
+        why="the path didn't follow the peer to a new port (it used port $old_port before)"
+        for _ in $(seq 30); do
+          new_port="$(direct_port "$from")"
+          if [ -n "$new_port" ] && [ "$new_port" != "$old_port" ]; then
+            ok=1
+            break
+          fi
+          sleep 1
+        done
       fi
     fi
   fi
 fi
+echo "harness: the first answer came over ${first:-nothing}" >>"$log"
 kill "${pids[@]}" 2>/dev/null || true
 wait "${pids[@]}" 2>/dev/null || true
 pids=()
