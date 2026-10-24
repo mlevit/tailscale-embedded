@@ -1,6 +1,6 @@
 #pragma once
 // WireGuard's messages, pure: Tailscale's wireguard-go fork at the commit v1.104.1 pins (417aef361226):
-// device/noise-protocol.go, noise-helpers.go, cookie.go, replay/replay.go and tai64n. The peer state machine (index
+// device/noise-protocol.go, noise-helpers.go, cookie.go, replay/replay.go, ratelimiter and tai64n. The peer state machine (index
 // table, keypair rotation, timers, queues) is wgdev.h's; this file makes and checks messages.
 //   - The handshake, Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s with WireGuard's identifier: the initiation (148 bytes) and
 //     the response (92), in both roles, and the transport keys both sides derive. Tailscale sets no preshared key: it
@@ -140,6 +140,22 @@ typedef struct {
 void tsnet_wg_replay_reset(tsnet_wg_replay_t *f);
 // ValidateCounter: false for a counter at or over `limit`, one too far behind, or one seen before.
 bool tsnet_wg_replay_check(tsnet_wg_replay_t *f, uint64_t counter, uint64_t limit);
+
+// ratelimiter.Ratelimiter, for handshakes under load: 20 a second per source, 5 in a burst. A source is a node
+// key, or 18 bytes of UDP address and port counted by the address alone (Go's DstIP), so a new port isn't a new
+// bucket. A source idle over 1 s frees its slot (Go's cleanup). With every slot active, a new source is refused, so a
+// flood from many sources can't refill its own buckets. Zeroed is empty.
+#define TSNET_WG_RATE_SOURCES 16
+typedef struct {
+    struct {
+        uint8_t key[32];
+        size_t key_len; // 0: a free slot
+        uint64_t last;  // ms
+        int64_t tokens; // ms of sending: a handshake costs 50, a source holds 250
+    } slot[TSNET_WG_RATE_SOURCES];
+} tsnet_wg_ratelimit_t;
+// Allow: true lets the source's handshake on.
+bool tsnet_wg_ratelimit_allow(tsnet_wg_ratelimit_t *r, const uint8_t *src, size_t src_len, uint64_t now_ms);
 
 #define TSNET_WG_TUN_MTU 1280 // tstun.DefaultTUNMTU: the safe MTU, as Tailscale's PMTUD is off by default
 

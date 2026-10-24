@@ -21,6 +21,8 @@ STUN, WireGuard and the IP packets behind it, and the packet filter. Also key ha
   TweetNaCl's. BLAKE2s, HMAC and HKDF follow RFC 7693, RFC 2104 and the Noise specification, checked against their
   test vectors.
 - A WireGuard packet's source address must belong to the peer that sent it, by longest match, as in wireguard-go.
+- Under a flood of handshakes, WireGuard asks each source for a cookie before any X25519, and limits each source to 20
+  handshakes a second, as wireguard-go does. WireGuard packets over DERP from a node key that isn't a peer are dropped.
 
 ## What the user must do
 
@@ -43,6 +45,4 @@ These are open:
 - **A peer's endpoint table can be filled.** A captured disco ping replayed from spoofed sources fills a peer's 16
   endpoint slots for 45 s, so the path stays on DERP. The official client holds 100 and always admits the netmap's
   endpoints.
-- **WireGuard's under-load cookie path isn't implemented.** Anyone with the node's public key can send handshake
-  initiations, and each costs an X25519 operation in the event loop.
 - **Not implemented:** IPv6 and tailnet lock (the node sends an NL key but signs nothing).

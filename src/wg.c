@@ -1,5 +1,5 @@
 // WireGuard's messages. See wg.h; the Go is Tailscale's wireguard-go fork, device/noise-protocol.go and
-// cookie.go, replay/replay.go and tai64n/tai64n.go.
+// cookie.go, replay/replay.go, ratelimiter/ratelimiter.go and tai64n/tai64n.go.
 #include "wg.h"
 #include <string.h>
 #include "blake2s.h"
@@ -507,6 +507,47 @@ bool tsnet_wg_replay_check(tsnet_wg_replay_t *f, uint64_t counter, uint64_t limi
     uint64_t old = f->ring[index_block];
     f->ring[index_block] = old | bit;
     return old != (old | bit);
+}
+
+// ratelimiter: packetsPerSecond 20, packetsBurstable 5, garbageCollectTime 1 s, in ms.
+#define RATE_COST_MS 50
+#define RATE_MAX_MS (RATE_COST_MS * 5)
+#define RATE_IDLE_MS 1000
+
+bool tsnet_wg_ratelimit_allow(tsnet_wg_ratelimit_t *r, const uint8_t *src, size_t src_len, uint64_t now_ms)
+{
+    size_t key_len = src_len == 18 ? 16 : src_len > 32 ? 32 : src_len;
+    int free_slot = -1;
+    for (int i = 0; i < TSNET_WG_RATE_SOURCES; i++) {
+        bool idle = r->slot[i].key_len == 0 || now_ms - r->slot[i].last > RATE_IDLE_MS;
+        if (!idle && r->slot[i].key_len == key_len && memcmp(r->slot[i].key, src, key_len) == 0) {
+            r->slot[i].tokens += (int64_t)(now_ms - r->slot[i].last);
+            r->slot[i].last = now_ms;
+            if (r->slot[i].tokens > RATE_MAX_MS) {
+                r->slot[i].tokens = RATE_MAX_MS;
+            }
+            // Go allows while tokens > cost, with nanoseconds passing between calls. At 1 ms a tick, >= gives the
+            // same 5 in a burst.
+            if (r->slot[i].tokens >= RATE_COST_MS) {
+                r->slot[i].tokens -= RATE_COST_MS;
+                return true;
+            }
+            return false;
+        }
+        if (idle && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) {
+        return false;
+    }
+    if (key_len > 0) {
+        memcpy(r->slot[free_slot].key, src, key_len);
+    }
+    r->slot[free_slot].key_len = key_len;
+    r->slot[free_slot].last = now_ms;
+    r->slot[free_slot].tokens = RATE_MAX_MS - RATE_COST_MS; // a new source: its first is allowed
+    return true;
 }
 
 static void transport_nonce(uint8_t nonce[TSNET_AEAD_NONCE_LEN], uint64_t counter)

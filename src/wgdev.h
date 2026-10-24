@@ -14,10 +14,17 @@
 //     after data was sent with nothing heard; the keys zeroed 540 s after the last session (3 × RejectAfterTime).
 //   - Keys kept fresh: the initiator rekeys after 120 s (RekeyAfterTime) or 2^60 messages, and once more 165 s in on
 //     receiving (keepKeyFreshReceiving). ScheduleHandshakeOnUserSend asks for one after the next send.
-// Not here: persistent keepalive (Tailscale sets none; magicsock's heartbeat keeps paths up), the under-load cookie
-// path (wireguard-go counts 128 queued handshakes; this loop handles each as it arrives, so it is never under load,
-// though it answers a cookie reply), the padding cap at the MTU, and AllowedIPs: a decrypted packet's
-// source is the IP side's to check.
+//   - Under load (IsUnderLoad, RoutineHandshake), a mac1-valid initiation or response must carry a mac2 from our
+//     cookie for its source. Without one it gets a cookie reply (cfg.reply) and nothing else, before any X25519. Then
+//     each source gets 20 handshakes a second, 5 in a burst (wg.h's tsnet_wg_ratelimit_allow). wireguard-go is under load with 128
+//     handshakes queued (1024 / 8) and for 1 s after. tsnet has no queue, so it counts the handshake messages that
+//     arrive instead: TSNET_WG_UNDER_LOAD in one second. Each initiation costs several X25519 on the device, and a node
+//     with a few dozen peers gets well under one a second.
+//   - A source is the sender's node key (over DERP) or its UDP address and port. wireguard-go uses one fixed address
+//     per known peer, so its cookie outlives a path change. tsnet's cookie for a UDP address doesn't: a peer that moves
+//     gets a new cookie.
+// Not here: persistent keepalive (Tailscale sets none; magicsock's heartbeat keeps paths up), the padding cap at the
+// MTU, and AllowedIPs: a decrypted packet's source is the IP side's to check.
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -33,6 +40,8 @@
 #define TSNET_WG_KEEPALIVE_MS 10000
 #define TSNET_WG_STAGED 16   // packets staged per peer while there's no session (wireguard-go: 128)
 #define TSNET_WG_MAX_PACKET 1500
+#define TSNET_WG_UNDER_LOAD 8        // handshake messages in one second that put the device under load (see above)
+#define TSNET_WG_UNDER_LOAD_MS 1000  // UnderLoadAfterTime: how long it stays under load after
 
 typedef struct tsnet_wgdev tsnet_wgdev_t;
 
@@ -50,6 +59,9 @@ typedef struct {
     // refuses an initiation whose timestamp isn't after the last it took from us, so a clock that isn't set yet (a
     // device before SNTP) gets refused until it is, by a peer that saw a later one.
     void (*wall)(void *ctx, int64_t *secs, uint32_t *nanos);
+    // A cookie reply for the sender at `src`, the bytes tsnet_wgdev_receive got (SendHandshakeCookie). It goes back the
+    // way the message came: to that node key, or to that UDP address and port. NULL sends none.
+    void (*reply)(void *ctx, const uint8_t *src, size_t src_len, const uint8_t *pkt, size_t len);
 } tsnet_wgdev_cfg_t;
 
 tsnet_wgdev_t *tsnet_wgdev_new(const tsnet_wgdev_cfg_t *cfg);
@@ -64,7 +76,8 @@ bool tsnet_wgdev_has_peer(const tsnet_wgdev_t *d, const uint8_t pub[32]);
 // over TSNET_WG_MAX_PACKET.
 int tsnet_wgdev_send(tsnet_wgdev_t *d, const uint8_t pub[32], const uint8_t *pkt, size_t len, uint64_t now);
 // A WireGuard message from the network (RoutineReceiveIncoming, RoutineHandshake, RoutineSequentialReceiver). `src`
-// is the sender's address bytes, for a cookie.
+// is the sender: its 32-byte node key (DERP), or 18 bytes of UDP address (16, IPv4 mapped) and port (2, big-endian).
+// It keys the cookie and the rate limiter. Under load, a handshake message with no `src` is dropped.
 void tsnet_wgdev_receive(tsnet_wgdev_t *d, const uint8_t *pkt, size_t len, const uint8_t *src, size_t src_len,
                          uint64_t now);
 // ScheduleHandshakeOnUserSend: a handshake after the peer's next data packet, if it has key material.

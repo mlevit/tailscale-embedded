@@ -51,6 +51,10 @@ struct tsnet_wgdev {
     tsnet_wg_cookiecheck_t check;
     peer_t **peers;
     size_t n_peers;
+    // Under load (wgdev.h): handshake messages counted since load_window, and when the load ends.
+    uint64_t load_window, load_until;
+    uint32_t load_count;
+    tsnet_wg_ratelimit_t rate;
 };
 
 static void wipe_keypair(keypair_t *k)
@@ -543,30 +547,85 @@ static void on_transport(tsnet_wgdev_t *d, const uint8_t *pkt, size_t len, uint6
     }
 }
 
+// RoutineReceiveIncoming queues every handshake message, and IsUnderLoad reads the queue's length. tsnet has no queue,
+// so it counts the handshake messages that arrive in each second (wgdev.h).
+static void count_handshake(tsnet_wgdev_t *d, uint64_t now)
+{
+    if (now - d->load_window >= 1000) {
+        d->load_window = now;
+        d->load_count = 0;
+    }
+    d->load_count++;
+}
+
+// IsUnderLoad: under load now, or within UnderLoadAfterTime of it.
+static bool under_load(tsnet_wgdev_t *d, uint64_t now)
+{
+    if (d->load_count >= TSNET_WG_UNDER_LOAD) {
+        d->load_until = now + TSNET_WG_UNDER_LOAD_MS;
+        return true;
+    }
+    return now < d->load_until;
+}
+
+// RoutineHandshake's checks on an initiation or a response: mac1, then under load a mac2 for `src` (else a cookie
+// reply, SendHandshakeCookie) and the rate limiter. True lets the message on to its X25519.
+static bool handshake_allowed(tsnet_wgdev_t *d, const uint8_t *pkt, size_t len, const uint8_t *src, size_t src_len,
+                              uint64_t now)
+{
+    if (!tsnet_wg_check_mac1(&d->check, pkt, len)) {
+        return false;
+    }
+    if (!under_load(d, now)) {
+        return true;
+    }
+    if (src_len == 0) {
+        return false; // no source to key a cookie on
+    }
+    if (!tsnet_wg_check_mac2(&d->check, pkt, len, src, src_len, now)) {
+        uint32_t sender = (uint32_t)pkt[4] | (uint32_t)pkt[5] << 8 | (uint32_t)pkt[6] << 16 | (uint32_t)pkt[7] << 24;
+        uint8_t reply[TSNET_WG_COOKIE_REPLY_LEN];
+        if (d->cfg.reply &&
+            tsnet_wg_create_cookie_reply(&d->check, pkt, len, sender, src, src_len, now, NULL, reply) == 0) {
+            d->cfg.reply(d->cfg.ctx, src, src_len, reply, sizeof reply);
+        }
+        return false;
+    }
+    return tsnet_wg_ratelimit_allow(&d->rate, src, src_len, now);
+}
+
 void tsnet_wgdev_receive(tsnet_wgdev_t *d, const uint8_t *pkt, size_t len, const uint8_t *src, size_t src_len,
                          uint64_t now)
 {
-    (void)src;
-    (void)src_len; // for a cookie reply, which this loop never sends (it is never under load)
     if (len < TSNET_WG_KEEPALIVE_LEN) {
         return;
+    }
+    if (!src) {
+        src_len = 0;
     }
     switch ((uint32_t)pkt[0] | (uint32_t)pkt[1] << 8 | (uint32_t)pkt[2] << 16 | (uint32_t)pkt[3] << 24) {
     case TSNET_WG_TRANSPORT:
         on_transport(d, pkt, len, now);
         break;
     case TSNET_WG_INITIATION:
-        if (len == TSNET_WG_INITIATION_LEN && tsnet_wg_check_mac1(&d->check, pkt, len)) {
-            on_initiation(d, pkt, now);
+        if (len == TSNET_WG_INITIATION_LEN) {
+            count_handshake(d, now);
+            if (handshake_allowed(d, pkt, len, src, src_len, now)) {
+                on_initiation(d, pkt, now);
+            }
         }
         break;
     case TSNET_WG_RESPONSE:
-        if (len == TSNET_WG_RESPONSE_LEN && tsnet_wg_check_mac1(&d->check, pkt, len)) {
-            on_response(d, pkt, now);
+        if (len == TSNET_WG_RESPONSE_LEN) {
+            count_handshake(d, now);
+            if (handshake_allowed(d, pkt, len, src, src_len, now)) {
+                on_response(d, pkt, now);
+            }
         }
         break;
     case TSNET_WG_COOKIE_REPLY:
         if (len == TSNET_WG_COOKIE_REPLY_LEN) {
+            count_handshake(d, now);
             on_cookie_reply(d, pkt, now);
         }
         break;

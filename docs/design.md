@@ -274,7 +274,8 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
     counted from magicsock's start).
   - A STUN binding packet on the socket goes to netcheck (`packetLooksLike`), a disco packet (over UDP or DERP) to
     `handleDiscoMessage`, and any other to `on_packet`: WireGuard's, with its source (an address and
-    port over UDP, a node key over DERP).
+    port over UDP, a node key over DERP). WireGuard over DERP from a node key no peer has is dropped
+    (`processDERPReadResult`).
   - NetInfo (tailcfg's, with the latencies) is reported when it changes as `BasicallyEqual` sees it, for the control
     client.
   - **Endpoints**: after each report, `selfeps.h`'s `determineEndpoints`; reported when the set changes
@@ -299,7 +300,8 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
     comes in to `tsnet_wgdev_receive`. WireGuard finds a transport packet's peer by its receiver index and an
     initiation's by its static key, so Go's map from source address to peer (`setNodeKeyForEpAddr`, which feeds
     wireguard-go's endpoints and wgengine's activity) isn't needed for routing, and isn't kept. A node with no trusted
-    path answers over DERP, as Go's does.
+    path answers over DERP, as Go's does. A cookie reply goes back to its source (`tsnet_magicsock_reply`, `Conn.Send`):
+    to a node key as any send goes, to a UDP address straight from the socket (`lazyEndpoint`).
   - Each peer is about 2.9 KB, measured on the host (mostly `endpoint.h`'s tables).
 - `src/selfeps.h`: this node's own endpoints, pure (`determineEndpoints`, `endpoint_tracker.go`,
   `netmon.LocalAddresses`).
@@ -334,13 +336,16 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
   At most 64 endpoints of a CallMeMaybe are kept (Go keeps all; a 1.5 KB packet holds 83). The node's disco key
   (`key.NewDisco`) is magicsock's: a new clamped X25519 key each start, never stored, as tailscaled does.
 - `src/wg.h`: WireGuard's messages, pure, from Tailscale's wireguard-go fork at the commit v1.104.1 pins
-  (417aef361226): `noise-protocol.go`, `noise-helpers.go`, `cookie.go`, `replay` and `tai64n`.
+  (417aef361226): `noise-protocol.go`, `noise-helpers.go`, `cookie.go`, `replay`, `ratelimiter` and `tai64n`.
   - **The handshake** (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s, no preshared key as Tailscale sets none): the initiation
     (148 bytes) and response (92) in both roles, and the transport keys. Consuming an initiation is two calls, as the
     peer lookup sits between decrypting the static key and the timestamp; a replayed timestamp and an initiation under
     50 ms after the last are refused.
   - **mac1 and mac2:** what every handshake message carries, the checks, and the cookie reply (XChaCha20-Poly1305 from
     Monocypher). The sender index sits outside the AEAD, covered by mac1 alone, so mac1 is checked first.
+  - **The rate limiter**, for handshakes under load: 20 a second per source, 5 in a burst, as wireguard-go's.
+    A UDP source counts by its address alone. **Different, for memory:** a table of 16 sources, not a map. With all 16
+    active, a new source is refused, so a flood from many sources can't refill its own buckets.
   - **Transport:** the 16-byte header, ChaCha20-Poly1305 with the counter as the nonce, padding to 16 (Go also caps the
     padding at the MTU; that comes with the IP side). The replay filter is RFC 6479's, an 8128-message window.
   - **Not here:** the index table, keypair rotation, the timers and queues.
@@ -359,8 +364,12 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
   - **The wall clock** dates an initiation (TAI64N). A peer refuses one not newer than the last it took from us.
   - **Different, for memory:** 16 packets staged per peer (wireguard-go: 128), each malloc'd, the oldest dropped. A
     peer is 4,080 bytes, measured on the host, mostly the three keypairs' replay rings (1,128 bytes each).
-  - **Not here:** persistent keepalive (Tailscale sets none), sending a cookie reply (never under load in one loop).
-    AllowedIPs is the tun's (below). Padding goes to a multiple of 16, never past the TUN MTU of 1280 (`tsnet_wg_padding`).
+  - **Under load**: a handshake message must carry a mac2 from our cookie for its source, or it gets a cookie
+    reply (back to that node key or UDP address) and no X25519. Then the rate limiter applies. **Different:**
+    wireguard-go is under load with 128 handshakes queued, and tsnet has no queue. It is under load at 8 handshake
+    messages in a second instead, and stays under load 1 s after, as Go does. A cookie for a UDP address doesn't follow
+    a peer to a new path (Go keys a known peer's by one fixed address).
+  - **Not here:** persistent keepalive (Tailscale sets none). AllowedIPs is the tun's (below). Padding goes to a multiple of 16, never past the TUN MTU of 1280 (`tsnet_wg_padding`).
 - `src/allowedips.h`: AllowedIPs (`allowedips.go`), each peer's prefixes from the netmap. The longest match
   routes an outgoing packet to its peer. A decrypted packet's source must have its peer as its longest match
   (`Lookup(src) != peer` drops), so a peer with a wide prefix can't send as an address another peer holds.

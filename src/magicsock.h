@@ -8,7 +8,7 @@
 //     no packet sent or received, the idle time wgengine gives Go's magicsock).
 //   - A STUN binding packet arriving on the socket goes to netcheck (packetLooksLike), and a disco packet, over UDP
 //     or DERP, to handleDiscoMessage; any other is WireGuard's, for on_packet. Disco from a disco key no peer
-//     has is dropped. A Ping gets a Pong the way it came; a Pong measures a path (endpoint.h); a CallMeMaybe, only
+//     has is dropped, and so is WireGuard over DERP from a node key no peer has (processDERPReadResult). A Ping gets a Pong the way it came; a Pong measures a path (endpoint.h); a CallMeMaybe, only
 //     over DERP from the peer whose disco key sealed it, pings the endpoints it lists.
 //   - NetInfo (the preferred DERP, whether UDP works, the mapping, the latencies) is reported when it changes as
 //     BasicallyEqual sees it (not the latencies), for the control client (tsnet_client_set_netinfo).
@@ -63,6 +63,10 @@ void tsnet_magicsock_set_peers(tsnet_magicsock_t *m, const tsnet_node_t *peers, 
 // to it (if any) and to the peer's home DERP (or the region it last reached us over), starting path discovery. What
 // WireGuard calls. 0, or -1 for no such peer, an expired one (errExpired) or no way to reach it.
 int tsnet_magicsock_send(tsnet_magicsock_t *m, const uint8_t key[TSNET_KEY_LEN], const uint8_t *pkt, size_t len);
+// A WireGuard cookie reply back to the source on_packet gave (Conn.Send's two cases): a node key goes as
+// tsnet_magicsock_send does, and a UDP address and port gets the packet straight from the socket (lazyEndpoint).
+// -1 for a source that is neither, or a key with no peer.
+int tsnet_magicsock_reply(tsnet_magicsock_t *m, const uint8_t *src, size_t src_len, const uint8_t *pkt, size_t len);
 // Conn.Ping's disco ping ("tailscale ping", endpoint.h's cli_ping): over the peer's DERP home while there's no
 // trusted path, and to its trusted path or every endpoint. The first pong goes to on_ping. -1 for no such peer, an
 // expired one, one without a disco key, or nothing to ping.

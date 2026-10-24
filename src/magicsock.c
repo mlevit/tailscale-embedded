@@ -398,6 +398,9 @@ static void derp_packet(void *ctx, int region, const uint8_t src[TSNET_KEY_LEN],
         handle_disco(m, data, len, NULL, 0, region, src);
         return;
     }
+    if (!p) {
+        return; // processDERPReadResult: "We don't know anything about this node key"
+    }
     m->last_traffic = tsnet_now_ms();
     if (m->cfg.on_packet) {
         m->cfg.on_packet(m->cfg.ctx, data, len, src, TSNET_KEY_LEN);
@@ -432,6 +435,17 @@ int tsnet_magicsock_send(tsnet_magicsock_t *m, const uint8_t key[TSNET_KEY_LEN],
         tsnet_derpmgr_send(m->derp, region, p->key, pkt, len);
     }
     return 0;
+}
+
+int tsnet_magicsock_reply(tsnet_magicsock_t *m, const uint8_t *src, size_t src_len, const uint8_t *pkt, size_t len)
+{
+    if (src_len == TSNET_KEY_LEN) {
+        return tsnet_magicsock_send(m, src, pkt, len);
+    }
+    if (src_len == 18) {
+        return tsnet_udp_send(m->fd, src, (uint16_t)(src[16] << 8 | src[17]), pkt, len) < 0 ? -1 : 0;
+    }
+    return -1;
 }
 
 int tsnet_magicsock_ping(tsnet_magicsock_t *m, const uint8_t key[TSNET_KEY_LEN])

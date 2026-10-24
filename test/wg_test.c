@@ -1,7 +1,8 @@
 // Host test of WireGuard's messages: wireguard-go's own KDF vectors (device/kdf_test.go) and replay cases
 // (replay/replay_test.go, from the Linux kernel's); then an independent reference's handshake, keys, transport and
 // cookie, byte for byte (test/wg_vectors.h, tools/wg_vectors.py: the WireGuard paper on OpenSSL and libsodium); every
-// changed byte; replays and floods; and a round trip with fresh ephemerals.
+// changed byte; replays and floods; a round trip with fresh ephemerals; and the handshake rate limiter
+// (ratelimiter/ratelimiter_test.go's cases).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,6 +351,48 @@ static void round_trip(void)
     EXPECT(tsnet_wg_open(back, sizeof back, ki.send, pkt, (size_t)n) == -1); // the wrong direction's key
 }
 
+// ratelimiter_test.go's TestRatelimiter: its 16 sources each step through the same results, the waits in ms. Then
+// what the bounded table adds: a new port is the same bucket, a 17th source is refused, and an idle one frees a slot.
+static void ratelimit(void)
+{
+    static const struct {
+        bool allowed;
+        uint64_t wait;
+    } steps[] = {{true, 0},  {true, 0},  {true, 0},   {true, 0}, {true, 0}, // the initial burst
+                 {false, 0},                                                // after it
+                 {true, 50}, {false, 0},                                    // tokens for one packet
+                 {true, 100}, {true, 0}, {false, 0}};                       // tokens for a two-packet burst
+    tsnet_wg_ratelimit_t r;
+    memset(&r, 0, sizeof r);
+    uint8_t src[TSNET_WG_RATE_SOURCES][18];
+    for (int i = 0; i < TSNET_WG_RATE_SOURCES; i++) {
+        memset(src[i], 0, 18);
+        src[i][15] = (uint8_t)(i + 1); // a distinct address each, port 0
+    }
+    uint64_t now = 5000;
+    for (size_t s = 0; s < sizeof steps / sizeof steps[0]; s++) {
+        now += steps[s].wait;
+        for (int i = 0; i < TSNET_WG_RATE_SOURCES; i++) {
+            EXPECT(tsnet_wg_ratelimit_allow(&r, src[i], 18, now) == steps[s].allowed);
+        }
+    }
+    // Source 0 on another port shares its empty bucket.
+    uint8_t moved[18];
+    memcpy(moved, src[0], 18);
+    moved[17] = 99;
+    EXPECT(!tsnet_wg_ratelimit_allow(&r, moved, 18, now));
+    // A 17th source, a node key: every slot is active, so it's refused.
+    uint8_t key[32];
+    memset(key, 7, sizeof key);
+    EXPECT(!tsnet_wg_ratelimit_allow(&r, key, 32, now));
+    // Over a second later every slot is idle: the key gets one, with a full burst.
+    now += 1001;
+    for (int i = 0; i < 5; i++) {
+        EXPECT(tsnet_wg_ratelimit_allow(&r, key, 32, now));
+    }
+    EXPECT(!tsnet_wg_ratelimit_allow(&r, key, 32, now));
+}
+
 int main(void)
 {
     kdf();
@@ -359,6 +402,7 @@ int main(void)
     vectors();
     tampering();
     round_trip();
+    ratelimit();
     if (failures == 0) {
         printf("tsnet wg_test: ok\n");
     }

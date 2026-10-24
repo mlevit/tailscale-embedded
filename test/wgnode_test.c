@@ -1,7 +1,7 @@
 // Host test of WireGuard over magicsock: two nodes on loopback, each a magicsock and a wgdev joined as
 // magicsock_run joins them (wgdev's messages go out with tsnet_magicsock_send; magicsock's non-disco packets go to
 // tsnet_wgdev_receive). With a direct path found by disco, an IP packet from A reaches B through a real handshake, and
-// B's answer comes back; a packet whose WireGuard message is garbage is dropped.
+// B's answer comes back; a packet whose WireGuard message is garbage is dropped; a cookie reply reaches a UDP source.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +171,22 @@ int main(void)
     tsnet_udp_send(fd, lo, tsnet_magicsock_port(b.ms), junk, sizeof junk);
     run(&a, &b, 200, NULL);
     EXPECT(b.delivered == 1);
+
+    // A cookie reply to a UDP source goes straight from A's socket (tsnet_magicsock_reply, as server.c wires it). A
+    // source that is neither a node key nor an address and port is refused.
+    uint8_t src[18], reply[TSNET_WG_COOKIE_REPLY_LEN], got[128], from[16];
+    uint16_t fd_port = tsnet_udp_port(fd), from_port = 0;
+    memcpy(src, lo, 16);
+    src[16] = (uint8_t)(fd_port >> 8);
+    src[17] = (uint8_t)fd_port;
+    memset(reply, 3, sizeof reply);
+    EXPECT(tsnet_magicsock_reply(a.ms, src, sizeof src, reply, sizeof reply) == 0);
+    EXPECT(tsnet_magicsock_reply(a.ms, src, 3, reply, sizeof reply) == -1);
+    int got_n = 0;
+    for (uint64_t end = tsnet_now_ms() + 1000; got_n == 0 && tsnet_now_ms() < end;) {
+        got_n = tsnet_udp_recv(fd, got, sizeof got, from, &from_port);
+    }
+    EXPECT(got_n == (int)sizeof reply && got[0] == 3 && from_port == tsnet_magicsock_port(a.ms));
     tsnet_sock_close(fd);
 
     tsnet_wgdev_free(a.wg);

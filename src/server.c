@@ -90,6 +90,12 @@ static void wg_send(void *ctx, const uint8_t peer[32], const uint8_t *pkt, size_
     tsnet_magicsock_send(s->ms, peer, pkt, len);
 }
 
+static void wg_reply(void *ctx, const uint8_t *src, size_t src_len, const uint8_t *pkt, size_t len)
+{
+    tsnet_server_t *s = ctx;
+    tsnet_magicsock_reply(s->ms, src, src_len, pkt, len);
+}
+
 static void wg_deliver(void *ctx, const uint8_t peer[32], const uint8_t *pkt, size_t len)
 {
     tsnet_server_t *s = ctx;
@@ -172,7 +178,8 @@ static bool start_data_plane(tsnet_server_t *s)
         .stun_filter = s->cfg.stun_filter ? stun_filter : NULL,
     };
     s->ms = tsnet_magicsock_new(&mc);
-    tsnet_wgdev_cfg_t wc = {.priv = s->id->node, .ctx = s, .send = wg_send, .deliver = wg_deliver};
+    tsnet_wgdev_cfg_t wc = {.priv = s->id->node, .ctx = s, .send = wg_send, .deliver = wg_deliver,
+                          .reply = wg_reply};
     s->wg = s->ms ? tsnet_wgdev_new(&wc) : NULL;
     if (!s->wg) {
         tsnet_log(TSNET_LOG_ERROR, "server: can't start magicsock or WireGuard");

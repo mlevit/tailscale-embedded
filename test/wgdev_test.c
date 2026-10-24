@@ -2,7 +2,7 @@
 // fake clock. A handshake on demand and data both ways; the responder's keypair confirmed by the first data; a
 // keepalive answering data; rekeying at 120 s, the old keypair still taking packets; a keypair refused past 180 s;
 // retransmits every 5 s and giving up after 20 initiations; a replayed packet dropped; a lazy peer made by its
-// initiation and reaped at 540 s; the staged queue's cap.
+// initiation and reaped at 540 s; the staged queue's cap; and under load, a cookie reply first, then the handshake.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +38,8 @@ static uint8_t a_pub[32], b_pub[32];
 static tsnet_wgdev_t *dev[2];
 static uint8_t last_sent[2][1600];
 static size_t last_sent_len[2];
+static int replies[2]; // cookie replies each side sent
+static char reply_src[8]; // the source the last one went back to
 
 static void on_send(void *ctx, const uint8_t peer[32], const uint8_t *pkt, size_t len)
 {
@@ -55,6 +57,16 @@ static void on_send(void *ctx, const uint8_t peer[32], const uint8_t *pkt, size_
     m->to = to;
     memcpy(m->data, pkt, len);
     m->len = len;
+}
+
+// A cookie reply goes back to its source; here that is always the other side.
+static void on_reply(void *ctx, const uint8_t *src, size_t src_len, const uint8_t *pkt, size_t len)
+{
+    int from = (int)(intptr_t)ctx;
+    replies[from]++;
+    memset(reply_src, 0, sizeof reply_src);
+    memcpy(reply_src, src, src_len < sizeof reply_src - 1 ? src_len : sizeof reply_src - 1);
+    on_send(ctx, NULL, pkt, len);
 }
 
 static void on_deliver(void *ctx, const uint8_t peer[32], const uint8_t *pkt, size_t len)
@@ -132,6 +144,7 @@ static void reset_world(bool lazy_b)
         tsnet_wgdev_free(dev[i]);
         sent_types[i][1] = sent_types[i][2] = sent_types[i][3] = sent_types[i][4] = 0;
         delivered[i] = 0;
+        replies[i] = 0;
         drop[i] = false;
     }
     q_head = q_tail = 0;
@@ -143,9 +156,9 @@ static void reset_world(bool lazy_b)
     tsnet_x25519_public(a_pub, a_priv);
     tsnet_x25519_public(b_pub, b_priv);
     tsnet_wgdev_cfg_t ca = {.priv = a_priv, .ctx = (void *)0, .send = on_send, .deliver = on_deliver,
-                            .wall = on_wall};
+                            .wall = on_wall, .reply = on_reply};
     tsnet_wgdev_cfg_t cb = {.priv = b_priv, .ctx = (void *)1, .send = on_send, .deliver = on_deliver,
-                            .lookup = on_lookup, .wall = on_wall};
+                            .lookup = on_lookup, .wall = on_wall, .reply = on_reply};
     dev[0] = tsnet_wgdev_new(&ca);
     dev[1] = tsnet_wgdev_new(&cb);
     EXPECT(tsnet_wgdev_add_peer(dev[0], b_pub, 0) == 0);
@@ -384,8 +397,59 @@ static void handshake_on_send(void)
     EXPECT(sent_types[0][1] == inits + 1 && sent_types[0][4] >= 2);
 }
 
+// Handshake messages B can't open (mac1 wrong), TSNET_WG_UNDER_LOAD of them at `now`: B is under load.
+static void load_b(uint64_t now)
+{
+    uint8_t junk[TSNET_WG_INITIATION_LEN] = {TSNET_WG_INITIATION};
+    for (int i = 0; i < TSNET_WG_UNDER_LOAD; i++) {
+        tsnet_wgdev_receive(dev[1], junk, sizeof junk, (const uint8_t *)"junk", 4, now);
+    }
+}
+
+// Under load: B answers A's initiation with a cookie reply instead of a response, and A's next initiation,
+// carrying a mac2 from that cookie, gets through. With no source, B drops the initiation. B stays under load for a
+// second after it last was, then takes initiations without a mac2 again.
+static void under_load(void)
+{
+    const uint64_t t0 = 1000 * SEC;
+    reset_world(false);
+    uint8_t pkt[1600];
+    size_t n = ip4(pkt, 10, 0x55);
+    load_b(t0);
+    tsnet_wgdev_send(dev[0], b_pub, pkt, n, t0);
+    pump(t0);
+    EXPECT(replies[1] == 1 && strcmp(reply_src, "src") == 0);
+    EXPECT(sent_types[1][2] == 0 && delivered[1] == 0);
+    // The same initiation again with no source: dropped, no reply.
+    tsnet_wgdev_receive(dev[1], last_sent[0], last_sent_len[0], NULL, 0, t0 + 1);
+    EXPECT(replies[1] == 1 && sent_types[1][2] == 0);
+    // A's retransmit, B under load again: the initiation carries the cookie's mac2, and the session comes up.
+    uint64_t retry = tsnet_wgdev_next(dev[0]);
+    EXPECT(retry >= t0 + TSNET_WG_REKEY_TIMEOUT_MS && retry < t0 + TSNET_WG_REKEY_TIMEOUT_MS + TSNET_WG_REKEY_JITTER_MS);
+    load_b(retry);
+    advance(retry, retry);
+    EXPECT(replies[1] == 1 && sent_types[1][2] == 1 && delivered[1] == 1);
+    EXPECT(tsnet_wgdev_session(dev[0], b_pub, NULL));
+
+    // The hold: under load at t0 + 500, so still under load at t0 + 1200 (a new second, one message in it), and not
+    // past t0 + 1500, when the same initiation, still without a mac2, gets a response.
+    reset_world(false);
+    load_b(t0);
+    tsnet_wgdev_send(dev[0], b_pub, pkt, n, t0 + 500);
+    uint8_t init[TSNET_WG_INITIATION_LEN];
+    memcpy(init, last_sent[0], sizeof init);
+    pump(t0 + 500);
+    EXPECT(replies[1] == 1);
+    tsnet_wgdev_receive(dev[1], init, sizeof init, (const uint8_t *)"src", 3, t0 + 1200);
+    EXPECT(replies[1] == 2 && sent_types[1][2] == 0);
+    tsnet_wgdev_receive(dev[1], init, sizeof init, (const uint8_t *)"src", 3, t0 + 500 + TSNET_WG_UNDER_LOAD_MS + 1);
+    pump(t0 + 500 + TSNET_WG_UNDER_LOAD_MS + 1);
+    EXPECT(replies[1] == 2 && sent_types[1][2] == 1 && delivered[1] == 1);
+}
+
 int main(void)
 {
+    under_load();
     session();
     new_handshake();
     rekey_on_receive();
