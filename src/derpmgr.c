@@ -376,13 +376,13 @@ int tsnet_derpmgr_send(tsnet_derpmgr_t *m, int region, const uint8_t dst[TSNET_K
                        size_t len)
 {
     slot_t *s = slot_for(m, region, dst);
-    if (s && !s->c) {
-        // derphttp's Send connects first: a write during the reader's backoff dials at once (the backoff only spaces
-        // out reconnects when nothing is written).
+    if (s && !s->c && tsnet_now_ms() >= s->retry_at) {
+        // Differs from Go's derphttp.Send, which connects at once: we respect the reconnect backoff.
+        // A first send to a fresh slot still dials at once; only a reconnect after a failure waits.
         connect_slot(m, s);
     }
     if (!s || !s->c) {
-        return -1; // no such region, no room, or no node to dial
+        return -1; // no such region, no room, or no node to dial; or backing off
     }
     return tsnet_derphttp_send(s->c, dst, pkt, len);
 }

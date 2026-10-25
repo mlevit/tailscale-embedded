@@ -131,16 +131,26 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
   - zstd: the client asks for `Compress: "zstd"` as the official client always does. Every frame in a message is
     decoded with the vendored libzstd (`third_party/zstd`, 1.5.7, unmodified).
   - The keep-alive fast path: the compressed `{"KeepAlive":true}`, once seen, is recognised without decoding.
-  - Limits, smaller than Go's for the device: 4 MB a message on the wire, checked before allocating (Go: 256 MB);
-    8 MB decoded (Go: 1 GB); a zstd window of at most 8 MB. Tailscale's `zstdframe`, and headscale (seen), write
-    single-segment frames, whose window is the message itself.
+  - Limits, smaller than Go's for the device: 2 MB a message on the wire, checked before allocating (Go:
+    256 MB, `TSNET_MAPMSG_WIRE_MAX`); 4 MB decoded (Go: 1 GB, `TSNET_MAPMSG_DECODED_MAX`); a zstd window of at most
+    4 MB (`TSNET_MAPMSG_WINDOW_LOG`). Tailscale's `zstdframe`, and headscale (seen), write single-segment frames, whose
+    window is the message itself. A real netmap is about 1.5 KB of JSON a peer, so 4 MB holds about 2,500 peers. A
+    message over a limit ends the poll with one log line that names the constant, and the client polls again with a
+    fresh session.
   - Memory: the decoder context and, while a message decodes, its window and output, all `malloc`'d (in PSRAM on the
-    device: `tsnet_malloc` prefers it).
+    device: `tsnet_malloc` prefers it). A message buffer that grew past `TSNET_MAPMSG_KEEP` (64 KB) is freed once the message is
+    handled, so one big netmap doesn't hold up to 6 MB for the rest of the poll.
+  - `src/json.h` also refuses JSON with more than `TSNET_JSON_MAX_VALUES` (200,000) values, because cJSON allocates a
+    node (about 50 to 60 bytes) for each one: 2 MB of `[1,1,...` would make a 60 MB tree. That is about 12 MB at most.
 - `src/netmap.h`: the netmap across one map poll, `map.go`'s `mapSession`. Each poll starts a new session, as
   each `sendMapRequest` makes a new `mapSession`.
   - Peers: a full `Peers` list replaces them all, and nothing else touches peers that message. Otherwise, in order:
     PeersRemoved, PeersChanged, PeerSeenChange ("seen" records the time given), OnlineChange, then PeersChangedPatch,
     field by field.
+  - Peer cap: at most `TSNET_NETMAP_PEERS_MAX` (1,024, under 1 MB; a home tailnet is a few hundred nodes). A
+    `Peers` or `PeersChanged` list is decoded for its first 1,024 nodes only. A new peer that would pass the cap is not
+    kept, however it arrives (a full list or `PeersChanged` growth), and one log line gives the count. Known peers
+    still update and a removal makes room. The poll goes on.
   - The rest: the self node; the DERP map's merge (absent Regions or HomeParams keep the old ones, and HomeParams
     without RegionScore keeps the old scores); the named packet filters (`PacketFilter` is "base", a `"*": null`
     clears them, a null list deletes one, `[]` stays an empty list); the domain; the control time.
@@ -237,7 +247,10 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
   - **A peer's region** opens when a packet goes there (`derpWriteChanForRegion`). A reply to a peer heard over
     another region goes back that way (`derpRoute`), which PeerGone and a broken connection remove.
   - **A broken connection** is dialed again after `runDerpReader`'s backoff (n² × 10 ms, at most 5 s, reset by any
-    message), or at once when a packet goes there meanwhile (derphttp's `Send` connects). **A non-home connection** closes after more than 60 s unwritten, checked every 15 s (`cleanStaleDerp`).
+    message). A packet sent while the backoff is running is dropped, not queued. The backoff window must pass before a
+    reconnect dials. A server that completes the handshake (sends a message) resets the backoff, so this bound
+    applies to servers that drop before any frame. **A non-home connection** closes after more than 60 s unwritten,
+    checked every 15 s (`cleanStaleDerp`).
   - **A DERP map** that redefines or drops a region closes its connection, and a home that went is cleared until the
     ReSTUN that follows sets one (`setDERPMap`). No map means no DERP.
   - At most 8 regions at once and 64 peer routes (the oldest route is forgotten). The timing rules are in `policy.h`.
@@ -317,6 +330,12 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
 - `src/endpoint.h`: a peer's paths, pure (`wgengine/magicsock/endpoint.go` without the sockets).
   - **Endpoints:** the netmap's, ones the peer pinged from (gone 45 s after its last ping), and a CallMeMaybe's
     (replaced by the next CallMeMaybe).
+  - **CallMeMaybe limits** (not in Go): Go drops only IPv6 link-local targets, so any peer could aim our pings
+    at loopback, multicast, broadcast or 169.254.169.254. tsnet also drops unspecified, loopback, multicast,
+    broadcast (255.255.255.255), IPv4 and IPv6 link-local and port 0 targets, and keeps LAN and public ones. It
+    handles one CallMeMaybe per peer per 2 s (`TSNET_CMM_MIN_INTERVAL_US`) and ignores the rest. A real peer sends
+    one at most every 3 s. The subnet-directed broadcast address isn't dropped: the endpoint code doesn't know the
+    local subnet.
   - **The best address** is a UDP endpoint that answered a ping, trusted for 6.5 s after each pong. A pong from a
     better address (`betterAddr`: latency, then loopback, link-local, private and IPv6 preferences, with 1%
     stickiness), or from any while the best is untrusted, replaces it. A ping to an untrusted best that times out
@@ -327,8 +346,14 @@ How tailscale-embedded is built, module by module, and why. The [README](../READ
     45 s pass without a send.
   - **Not here:** UDP relay (Geneve) paths, peer MTU probing (off by default in Go), WireGuard-only peers, UDP
     lifetime probes and the pong history (Go reads it only for WireGuard-only peers and status).
-  - **Caps where Go grows:** 16 endpoints per peer (Go prunes at 100: past 16, a new one waits until one expires)
-    and 32 pings in flight (the oldest is forgotten).
+  - **Caps where Go grows:** 16 endpoints per peer (Go prunes at 100) and 32 pings in flight (the oldest is
+    forgotten). When the 16 are full, a new ping-learned candidate waits until one expires, but a netmap or
+    CallMeMaybe endpoint evicts the oldest candidate, so pings from spoofed addresses can't keep the real
+    endpoints out. Netmap and CallMeMaybe endpoints are never evicted.
+  - **Ping replay** (not in Go): the last 32 ping txids of each peer are remembered, from any address. A
+    repeated txid draws no pong and adds no candidate. Go remembers one txid per endpoint, so a captured ping replayed
+    from alternating addresses drew a pong each time. Pings over DERP don't go through this: a DERP replay can only
+    make the node answer the peer that sent it.
 - `src/disco.h`: `disco/disco.go`, pure. Ping (TxID, node key, padding), Pong (TxID, the source address) and
   CallMeMaybe (endpoints), parsed and marshalled as Go does (a zero node key left out, trailing zeros read as padding,
   a CallMeMaybe of another version or a partial endpoint read as none); the relay messages (4 to 9) recognised, not
@@ -457,10 +482,11 @@ broken forms; `tailcfg_test.c` reads the requests back as JSON, decodes headscal
 messages (`test/fixtures/headscale/`), hand-built deltas and patches, malformed fields, and the real message cut short
 and byte-flipped; `mapmsg_test.c` splits messages at every byte and decodes `test/fixtures/zstd/` (headscale's own
 frames, the reference CLI's from a real message, a keep-alive repeated, two frames in a message, a bomb past the
-decoded cap, a 32 MB window, truncation, a flipped byte, and garbage), written by `tools/zstd_fixtures.sh` from the
+decoded cap, a 32 MB window, truncation, a flipped byte, and garbage; and, built in the test, a bomb of a few dozen
+bytes just past the decoded cap, one at the cap, an 8 MB window and a big message followed by a small one), written by `tools/zstd_fixtures.sh` from the
 reference `zstd` CLI built from the same release; `netmap_test.c` applies sequences (headscale's real first message,
 then every delta, patch, DERP merge and filter case) and checks the state after each, plus 2,000 random adds and
-removes against the expected set; `identity_test.c` checks the keys across restarts in a temporary state directory, the
+removes against the expected set, and the peer cap (a full list, then growth through `PeersChanged`); `identity_test.c` checks the keys across restarts in a temporary state directory, the
 node-key steps of `doLogin`, RFC 8032's first Ed25519 vector and the log ID's SHA-256; `policy_test.c` checks the
 backoff steps and cap, the rate-limit and `Retry-After` rules, and what each register and map response means;
 `crypto_test.c` also checks NaCl box against PyNaCl (libsodium) at 18 lengths around the block edges, with every byte of
@@ -474,10 +500,11 @@ it checks the request, sends the 101 and the greeting in one write, opens Client
 all fail; a packet queued while connecting arrives after ClientInfo and NotePreferred. `derpmgr_test.c` runs the
 DERP manager against two loopback DERP servers (a fork per connection, each packet answered as if its peer replied):
 no map, the fallback home, a bigger map keeping the home, a peer's region opened on demand, the reply sent back over
-the region the peer was heard on, the home dialed again after its connection breaks, a packet during the backoff
-dialing at once, a home the map lacks (set, nothing opened), a region redefined, the home's region dropped (a new
-home), and no map again. `policy_test.c` checks the 5 s backoff cap, the 60 s idle rule and
-the fallback. `stun_test.c` parses Go's own response vectors (`net/stun/stun_test.go`'s nine real responses, written
+the region the peer was heard on, the home dialed again twice after its connection breaks, a home the map lacks (set,
+nothing opened), a region redefined, the home's region dropped (a new home), no map again, and a server that drops
+every connection before any frame while a packet goes every few ms for 1 s: it counts 2 to 10 dials, as the backoff
+allows, not one per packet. `policy_test.c` checks the 5 s backoff cap, the 60 s idle rule and the fallback.
+`stun_test.c` parses Go's own response vectors (`net/stun/stun_test.go`'s nine real responses, written
 to `test/stun_vectors.h` by `tools/stun_vectors.py`) with every truncation and byte change, Go's `Is` and `Response`
 cases, a request matching one built with Python's zlib CRC-32, each way `ParseBindingRequest` refuses, and a request and
 response between two UDP sockets on loopback. `ncplan_test.c` ports Go's own `netcheck_test.go` cases: every

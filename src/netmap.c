@@ -65,7 +65,8 @@ static size_t find(const tsnet_netmap_t *nm, int64_t id, bool *found)
     return lo;
 }
 
-// ms.peers[n.ID] = n
+// ms.peers[n.ID] = n. Returns 0, -1 out of memory, or 1 when the peer is new and the netmap already has
+// TSNET_NETMAP_PEERS_MAX: the peer is then not kept, and the caller still owns it.
 static int upsert(tsnet_netmap_t *nm, tsnet_node_t *n)
 {
     bool found;
@@ -74,6 +75,9 @@ static int upsert(tsnet_netmap_t *nm, tsnet_node_t *n)
         tsnet_node_free(&nm->peers[i]);
         nm->peers[i] = take(n);
         return 0;
+    }
+    if (nm->n_peers >= TSNET_NETMAP_PEERS_MAX) {
+        return 1;
     }
     if (nm->n_peers == nm->cap_peers) {
         size_t cap = nm->cap_peers ? nm->cap_peers * 2 : 8;
@@ -110,31 +114,46 @@ static tsnet_node_t *peer_mut(tsnet_netmap_t *nm, int64_t id)
     return found ? &nm->peers[i] : NULL;
 }
 
+static void refuse_log(size_t refused)
+{
+    if (refused > 0) {
+        tsnet_log(TSNET_LOG_WARN, "netmap: %zu peers not kept, the netmap is at TSNET_NETMAP_PEERS_MAX (%d)", refused,
+                  TSNET_NETMAP_PEERS_MAX);
+    }
+}
+
 // updatePeersStateFromResponse. Returns whether the peers changed, or -1 out of memory.
 static int peers(tsnet_netmap_t *nm, tsnet_map_resp_t *r, int64_t now)
 {
     int changed = 0;
+    size_t refused = 0; // new peers not kept, for being past TSNET_NETMAP_PEERS_MAX
     if (r->n_peers > 0) { // not delta encoded: the new set replaces the old, and nothing else applies this turn
         for (size_t i = 0; i < nm->n_peers; i++) {
             tsnet_node_free(&nm->peers[i]);
         }
         nm->n_peers = 0;
         for (size_t i = 0; i < r->n_peers; i++) {
-            if (upsert(nm, &r->peers[i]) != 0) {
+            int u = upsert(nm, &r->peers[i]);
+            if (u < 0) {
                 return -1;
             }
+            refused += (size_t)u;
         }
+        refuse_log(refused);
         return 1;
     }
     for (size_t i = 0; i < r->n_peers_removed; i++) {
         changed |= remove_peer(nm, r->peers_removed[i]);
     }
     for (size_t i = 0; i < r->n_peers_changed; i++) {
-        if (upsert(nm, &r->peers_changed[i]) != 0) {
+        int u = upsert(nm, &r->peers_changed[i]);
+        if (u < 0) {
             return -1;
         }
+        refused += (size_t)u;
         changed = 1;
     }
+    refuse_log(refused);
     for (size_t i = 0; i < r->n_seen_change; i++) {
         tsnet_node_t *p = peer_mut(nm, r->seen_change[i].id);
         if (p) {

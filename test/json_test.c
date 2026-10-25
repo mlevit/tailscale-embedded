@@ -59,6 +59,24 @@ int main(void)
     EXPECT(parses("{\"a\":\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\\\"[[[[[[[[[[[[[\"}"));
     EXPECT(tsnet_json_parse(NULL, 0) == NULL);
 
+    // A value count past TSNET_JSON_MAX_VALUES is refused, at the cap it parses: `[1,1,1,...` is the cheapest
+    // way to make cJSON allocate.
+    {
+        size_t n = TSNET_JSON_MAX_VALUES + 10;
+        char *flat = malloc(n * 2 + 3);
+        char *p = flat;
+        *p++ = '[';
+        for (size_t i = 0; i < n; i++) {
+            *p++ = '1', *p++ = ',';
+        }
+        p[-1] = ']', *p = '\0';
+        EXPECT(!parses(flat));
+        flat[(TSNET_JSON_MAX_VALUES - 2) * 2 + 2] = ']'; // the opener and TSNET_JSON_MAX_VALUES - 2 commas
+        flat[(TSNET_JSON_MAX_VALUES - 2) * 2 + 3] = '\0';
+        EXPECT(parses(flat));
+        free(flat);
+    }
+
     // The map parser goes through it too: a map message nested 1000 deep is refused, not parsed.
     char *msg = malloc(3000), *inner = nested(1000, '[', ']');
     snprintf(msg, 3000, "{\"Domain\":%s}", inner);

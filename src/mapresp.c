@@ -315,6 +315,11 @@ static tsnet_node_t *nodes(ctx_t *c, const cJSON *a, size_t *n)
         return NULL;
     }
     size_t count = (size_t)cJSON_GetArraySize(a);
+    if (count > TSNET_NETMAP_PEERS_MAX) { // the extra nodes are dropped, the message and the poll go on
+        tsnet_log(TSNET_LOG_WARN, "map message lists %zu nodes: only the first TSNET_NETMAP_PEERS_MAX (%d) are kept", count,
+                  TSNET_NETMAP_PEERS_MAX);
+        count = TSNET_NETMAP_PEERS_MAX;
+    }
     tsnet_node_t *out = count ? tsnet_calloc(count, sizeof *out) : NULL;
     if (count && out == NULL) {
         c->bad = 1;
@@ -323,6 +328,9 @@ static tsnet_node_t *nodes(ctx_t *c, const cJSON *a, size_t *n)
     const cJSON *e;
     cJSON_ArrayForEach(e, a)
     {
+        if (*n == count) {
+            break;
+        }
         node(c, &out[(*n)++], e, false);
     }
     return out;

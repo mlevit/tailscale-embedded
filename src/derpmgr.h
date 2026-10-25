@@ -6,7 +6,8 @@
 //     else a random region.
 //   - A peer's region, opened on demand when a packet goes there (derpWriteChanForRegion). If the node already heard
 //     from that peer over another region, the packet goes back that way instead (derpRoute).
-//   - A broken connection is dialed again after runDerpReader's backoff (n² × 10 ms, at most 5 s, reset by any message).
+//   - A broken connection is dialed again after runDerpReader's backoff (n² × 10 ms, at most 5 s, reset by any
+//     message). Packets sent during the backoff are dropped. A server that sends a message resets the backoff.
 //   - A connection that isn't the home one closes after 60 s with nothing written to it, checked every 15 s
 //     (cleanStaleDerp).
 //   - A DERP map that redefines or drops a region closes its connection (setDERPMap); if it was home, the home is
@@ -44,7 +45,7 @@ int tsnet_derpmgr_set_home(tsnet_derpmgr_t *m, int region);
 int tsnet_derpmgr_home(const tsnet_derpmgr_t *m);
 
 // SendDERPPacketTo: a packet for the peer `dst` via `region` (its home, from the netmap). 0 if queued, -1 if dropped
-// (no such region, the queue is full, no room for another connection).
+// (no such region, the queue is full, no room for another connection, or backing off after a failure).
 int tsnet_derpmgr_send(tsnet_derpmgr_t *m, int region, const uint8_t dst[TSNET_KEY_LEN], const uint8_t *pkt,
                        size_t len);
 

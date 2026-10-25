@@ -270,13 +270,16 @@ int main(void)
     EXPECT(run_until(m, 3000, home_down));
     EXPECT(run_until(m, 3000, home_connected));
     EXPECT(tsnet_derpmgr_conngen(m, 1) == 2);
-    // It breaks again, and a packet sent before the backoff is over dials at once (derphttp's Send connects) and goes.
+    // It breaks again. A packet sent during the backoff (5-15 ms here) is dropped instead of dialing: the
+    // dropping server below counts the dials, since this window is too short to time. After the backoff the home
+    // reconnects and a packet goes.
     EXPECT(tsnet_derpmgr_send(m, 1, peer, (const uint8_t *)"bye", 3) == 0);
     EXPECT(run_until(m, 3000, home_down));
+    EXPECT(run_until(m, 3000, home_connected));
+    EXPECT(tsnet_derpmgr_conngen(m, 1) == 3);
     last_data[0] = 0;
     EXPECT(tsnet_derpmgr_send(m, 1, peer, (const uint8_t *)"hi", 2) == 0);
     EXPECT(run_until(m, 3000, got_hi) && last_region == 1);
-    EXPECT(tsnet_derpmgr_conngen(m, 1) == 3);
     // A home the map lacks is set anyway, as setNearestDERP does, and opens nothing; then back to region 1.
     n = tsnet_derpmgr_regions(m, got, 8);
     EXPECT(tsnet_derpmgr_set_home(m, 99) == 99 && tsnet_derpmgr_regions(m, got, 8) == n);
@@ -313,6 +316,58 @@ int main(void)
     EXPECT(tsnet_derpmgr_set_home(m, 0) == 5);
     EXPECT(!run_until(m, 400, home_connected));
     EXPECT(tsnet_derpmgr_conngen(m, 5) == 0);
+
+    // A server that accepts each connection and drops it before any frame, while packets keep coming: the
+    // dials follow the backoff, not the packets. The server writes a byte to a pipe for each connection it accepts.
+    uint16_t drop_port;
+    int drop = listener(&drop_port);
+    int accepted[2];
+    if (drop >= 0 && pipe(accepted) == 0) {
+        pid_t drop_srv = fork();
+        if (drop_srv == 0) {
+            close(accepted[0]);
+            for (int i = 0; i < 15; i++) { // without the fix, 1 s of packets dials far more than 15 times
+                int fd = accept(drop, NULL, NULL);
+                if (fd >= 0) {
+                    close(fd);
+                    (void)write(accepted[1], "x", 1);
+                }
+            }
+            _exit(0);
+        }
+        close(accepted[1]);
+        // Set up a region for this server, with a fresh manager.
+        tsnet_derpmgr_free(m);
+        m = tsnet_derpmgr_new(&cfg);
+        tsnet_derp_node_t n_drop = node("drop", 6, drop_port);
+        tsnet_derp_region_t region_drop = {.region_id = 6, .nodes = &n_drop, .n_nodes = 1};
+        tsnet_derp_map_t map_drop = {.has_regions = true, .regions = &region_drop, .n_regions = 1};
+        tsnet_derpmgr_set_map(m, &map_drop);
+        tsnet_derpmgr_set_home(m, 0);
+        // First send must dial at once (fresh slot, retry_at = 0).
+        EXPECT(tsnet_derpmgr_send(m, 6, peer, (const uint8_t *)"first", 5) == 0);
+        // A packet every few ms for 1 s.
+        tsnet_poll_t p[TSNET_DERPMGR_REGIONS];
+        int wait = 0;
+        uint64_t end_ms = tsnet_now_ms() + 1000;
+        while (tsnet_now_ms() < end_ms) {
+            tsnet_derpmgr_send(m, 6, peer, (const uint8_t *)"msg", 3);
+            int np = tsnet_derpmgr_poll(m, p, TSNET_DERPMGR_REGIONS, &wait);
+            tsnet_poll(p, np, wait < 0 || wait > 5 ? 5 : wait);
+            tsnet_derpmgr_step(m);
+        }
+        tsnet_derpmgr_free(m);
+        m = tsnet_derpmgr_new(&cfg);
+        kill(drop_srv, SIGKILL);
+        waitpid(drop_srv, NULL, 0);
+        close(drop);
+        char buf[32];
+        ssize_t dials = read(accepted[0], buf, sizeof buf); // the child is gone, so this doesn't block
+        close(accepted[0]);
+        // The backoff after the n-th failure is n² × 10 ms, at least half that with jitter: 1 s holds the first dial
+        // and at most 8 retries, however fast the loop runs. More than one shows it does retry.
+        EXPECT(dials >= 2 && dials <= 10);
+    }
 
     // No map: everything closes, and there's no home.
     tsnet_derpmgr_set_map(m, NULL);

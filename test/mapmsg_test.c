@@ -63,6 +63,21 @@ static size_t frame(unsigned char *out, const unsigned char *msg, size_t len)
     return 4 + len;
 }
 
+// A zstd frame of `blocks` RLE blocks of 128 KB each, with a 4 MB window and no content size: it decodes to
+// blocks * 128 KB of 'x' from a few dozen bytes (a zstd bomb whose size the decoder learns only as it goes).
+static size_t rle_frame(unsigned char *out, size_t blocks)
+{
+    static const unsigned char head[] = {0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x60}; // magic, no flags, window 2^22
+    memcpy(out, head, sizeof head);
+    size_t n = sizeof head;
+    for (size_t i = 0; i < blocks; i++) {
+        uint32_t h = (131072u << 3) | (1u << 1) | (i + 1 == blocks ? 1u : 0u); // size, RLE, last
+        out[n++] = (unsigned char)h, out[n++] = (unsigned char)(h >> 8), out[n++] = (unsigned char)(h >> 16);
+        out[n++] = 'x';
+    }
+    return n;
+}
+
 static int feed_one(bool zstd, const unsigned char *msg, size_t len, seen_t *s)
 {
     unsigned char *wire = malloc(len + 4);
@@ -164,7 +179,7 @@ int main(int argc, char **argv)
         z = slurp("zstd/big-window.zst", &zl);
         EXPECT(feed_one(true, z, zl, &s) == -1 && s.n == 0);
         free(z);
-        const unsigned char huge[4] = {0x01, 0x00, 0x40, 0x00}; // 4 MB + 1
+        const unsigned char huge[4] = {0x01, 0x00, 0x20, 0x00}; // 2 MB + 1: TSNET_MAPMSG_WIRE_MAX is 2 MB
         tsnet_mapmsg_t *m = tsnet_mapmsg_new(false);
         EXPECT(tsnet_mapmsg_feed(m, huge, 4, on_msg, &s) == -1);
         EXPECT(tsnet_mapmsg_feed(m, (const unsigned char *)"x", 1, on_msg, &s) == -1); // stays failed
@@ -173,6 +188,38 @@ int main(int argc, char **argv)
         EXPECT(feed_one(true, z, zl / 2, &s) == -1 && s.n == 0); // half a frame, sized as a whole message
         free(z);
         EXPECT(feed_one(true, (const unsigned char *)"{\"KeepAlive\":true}", 18, &s) == -1); // not zstd
+    }
+
+    // A bomb built here: a few dozen bytes that decode to just over TSNET_MAPMSG_DECODED_MAX are refused, with
+    // nothing handed to the app; the same frame one block shorter, at the cap, decodes whole; and a message after a
+    // refusal, on a new stream as the client makes after a failed poll, decodes as usual.
+    {
+        enum { OVER = TSNET_MAPMSG_DECODED_MAX / 131072 + 1, AT = TSNET_MAPMSG_DECODED_MAX / 131072 };
+        unsigned char z[6 + 4 * OVER];
+        size_t zl = rle_frame(z, OVER);
+        EXPECT(zl < 300 && feed_one(true, z, zl, &s) == -1 && s.n == 0);
+        zl = rle_frame(z, AT);
+        EXPECT(feed_one(true, z, zl, &s) == 0 && s.n == 1 && s.total == TSNET_MAPMSG_DECODED_MAX);
+        // the 4 MB window cap: a frame whose header asks for a 8 MB window is refused before any output
+        zl = rle_frame(z, 1);
+        z[5] = 0x68; // window 2^23
+        EXPECT(feed_one(true, z, zl, &s) == -1 && s.n == 0);
+        size_t kl;
+        unsigned char *ka = slurp("zstd/keepalive.zst", &kl);
+        EXPECT(feed_one(true, ka, kl, &s) == 0 && s.n == 1 && s.keep_alives == 0 && s.last_len == 18);
+        free(ka);
+        // a message over TSNET_MAPMSG_KEEP, then a small one: the big message's buffers are freed, and both decode
+        zl = rle_frame(z, 3); // 384 KB decoded
+        unsigned char wire[256];
+        size_t n = frame(wire, z, zl);
+        tsnet_mapmsg_t *m = tsnet_mapmsg_new(true);
+        memset(&s, 0, sizeof s);
+        EXPECT(tsnet_mapmsg_feed(m, wire, n, on_msg, &s) == 0 && s.n == 1 && s.total == 3 * 131072);
+        ka = slurp("zstd/keepalive.zst", &kl);
+        n = frame(wire, ka, kl);
+        EXPECT(tsnet_mapmsg_feed(m, wire, n, on_msg, &s) == 0 && s.n == 2 && s.last_len == 18);
+        free(ka);
+        tsnet_mapmsg_free(m);
     }
 
     // Garbage of every length as compressed messages: an error or a message, never a memory error.

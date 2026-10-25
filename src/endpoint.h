@@ -27,10 +27,12 @@
 #define TSNET_PING_TIMEOUT_US 5000000ULL        // pingTimeoutDuration (tsconst.DefaultPingTimeout)
 #define TSNET_DISCO_PING_INTERVAL_US 5000000ULL // discoPingInterval (tsconst.DefaultPingInterval)
 #define TSNET_GOOD_ENOUGH_LATENCY_US 5000ULL    // goodEnoughLatency
+#define TSNET_CMM_MIN_INTERVAL_US 2000000ULL    // at most one CallMeMaybe handled per peer per 2 s (not in Go)
 #define TSNET_SAFE_WIRE_MTU 1360                // tstun.SafeWireMTU (1280 + 80): a ping of size 0's wireMTU
 
 #define TSNET_EP_STATES 16
 #define TSNET_EP_PINGS 32
+#define TSNET_GOT_TXIDS 32 // ping txids remembered per peer, to answer a ping once
 
 // addrQuality: a UDP address (or none), its latency and the path MTU it was probed at.
 typedef struct {
@@ -59,7 +61,6 @@ typedef struct {
     bool in_netmap;          // index != indexSentinelDeleted
     uint64_t last_ping;      // when we last pinged it, 0 never
     uint64_t last_got_ping;  // when it last pinged us, 0 for a netmap endpoint
-    uint8_t last_got_ping_tx[12];
     uint64_t call_me_maybe;  // when a CallMeMaybe last listed it, 0 never
     bool cmm;                // in isCallMeMaybeEP: the last CallMeMaybe listed it
 } tsnet_epstate_t;
@@ -81,8 +82,10 @@ typedef struct {
     tsnet_epstate_t st[TSNET_EP_STATES];
     tsnet_sentping_t sent[TSNET_EP_PINGS];
     tsnet_addrq_t best;
-    uint64_t trust_until, last_full_ping, last_send_ext; // 0: never
-    bool heartbeat;                                      // heartBeatTimer is set
+    uint64_t trust_until, last_full_ping, last_send_ext, last_cmm; // 0: never
+    uint8_t got_tx[TSNET_GOT_TXIDS][12];                           // the txids of the last pings the peer sent
+    uint8_t got_tx_n, got_tx_next;
+    bool heartbeat;                                     // heartBeatTimer is set
     uint64_t heartbeat_at;
     uint32_t cli_seq, cli_answered; // the latest CLI ping, and the latest one answered (pingResultAndCallback.taken)
 } tsnet_endpoint_t;
@@ -120,7 +123,9 @@ void tsnet_endpoint_reset(tsnet_endpoint_t *e);
 void tsnet_endpoint_send(tsnet_endpoint_t *e, uint64_t now, tsnet_addrq_t *udp, bool *derp, tsnet_ep_actions_t *a);
 // addrForSendLocked alone, for status: the same answer as send gives, changing nothing.
 void tsnet_endpoint_addr_for_send(const tsnet_endpoint_t *e, uint64_t now, tsnet_addrq_t *udp, bool *derp);
-// addCandidateEndpoint: the peer pinged us from ip:port with txid. True if it's the same ping again (no pong).
+// addCandidateEndpoint: the peer pinged us from ip:port with txid. True if txid is one of its last 32 (no pong), from
+// any address (Go remembers one per endpoint). A new candidate never evicts one, but the netmap's and a
+// CallMeMaybe's endpoints evict the oldest candidate when the table is full.
 bool tsnet_endpoint_got_ping(tsnet_endpoint_t *e, uint64_t now, const uint8_t ip[16], uint16_t port,
                              const uint8_t txid[12]);
 // handlePongConnLocked. False if the txid isn't one of this peer's pings. A pong over DERP only ends its ping; one over
@@ -131,7 +136,9 @@ bool tsnet_endpoint_pong(tsnet_endpoint_t *e, uint64_t now, const uint8_t txid[1
 // trusted path alone if there is one, else to every endpoint, with no 5 s limit. The first pong answers it (`res` of
 // tsnet_endpoint_pong). It counts as a send: the heartbeat starts.
 void tsnet_endpoint_cli_ping(tsnet_endpoint_t *e, uint64_t now, bool has_derp, tsnet_ep_actions_t *a);
-// handleCallMeMaybe: the endpoints listed replace the last CallMeMaybe's, and every endpoint gets a ping now.
+// handleCallMeMaybe: the endpoints listed replace the last CallMeMaybe's, and every endpoint gets a ping now. Not as
+// in Go: one within 2 s of the last is ignored, and unspecified, loopback, multicast, broadcast, link-local
+// and port 0 targets are dropped.
 void tsnet_endpoint_call_me_maybe(tsnet_endpoint_t *e, uint64_t now, const tsnet_disco_ep_t *eps, size_t n,
                                   tsnet_ep_actions_t *a);
 // The timers: ping timeouts (discoPingTimeout) and the heartbeat. Fills `a` with the pings.

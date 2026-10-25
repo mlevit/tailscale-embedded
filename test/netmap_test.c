@@ -217,6 +217,49 @@ int main(int argc, char **argv)
     }
     tsnet_netmap_free(&nm);
 
+    // The peer cap: a full list over TSNET_NETMAP_PEERS_MAX keeps the first TSNET_NETMAP_PEERS_MAX, and a
+    // PeersChanged that would grow the netmap past it adds nothing new, while a known peer still updates and the
+    // netmap stays usable (a removal makes room).
+    {
+        enum { MAX = TSNET_NETMAP_PEERS_MAX };
+        tsnet_netmap_init(&nm);
+        EXPECT(apply(&nm, "{\"Node\":{\"ID\":99999}}", 0) > 0);
+        size_t cap = (size_t)(MAX + 10) * 24 + 32;
+        char *big = malloc(cap);
+        size_t n = (size_t)snprintf(big, cap, "{\"Peers\":[");
+        for (int i = 1; i <= MAX + 10; i++) {
+            n += (size_t)snprintf(big + n, cap - n, "%s{\"ID\":%d}", i > 1 ? "," : "", i);
+        }
+        snprintf(big + n, cap - n, "]}");
+        EXPECT(apply(&nm, big, 0) == TSNET_NM_PEERS && nm.n_peers == MAX);
+        EXPECT(tsnet_netmap_peer(&nm, MAX) != NULL && tsnet_netmap_peer(&nm, MAX + 1) == NULL);
+        EXPECT(apply(&nm, "{\"PeersChanged\":[{\"ID\":5000,\"Hostinfo\":{\"Hostname\":\"new\"}}]}", 0) == TSNET_NM_PEERS &&
+               nm.n_peers == MAX && tsnet_netmap_peer(&nm, 5000) == NULL);
+        EXPECT(apply(&nm, "{\"PeersChanged\":[{\"ID\":7,\"Hostinfo\":{\"Hostname\":\"old\"}}]}", 0) == TSNET_NM_PEERS &&
+               nm.n_peers == MAX && strcmp(tsnet_netmap_peer(&nm, 7)->hostname, "old") == 0);
+        EXPECT(apply(&nm, "{\"PeersRemoved\":[1]}", 0) == TSNET_NM_PEERS && nm.n_peers == MAX - 1);
+        EXPECT(apply(&nm, "{\"PeersChanged\":[{\"ID\":5000}]}", 0) == TSNET_NM_PEERS && nm.n_peers == MAX &&
+               tsnet_netmap_peer(&nm, 5000) != NULL);
+        tsnet_netmap_free(&nm);
+        // growth across messages: two PeersChanged of 600 new peers each stop at the cap
+        tsnet_netmap_init(&nm);
+        EXPECT(apply(&nm, "{\"Node\":{\"ID\":99999}}", 0) > 0);
+        for (int round = 0; round < 2; round++) {
+            n = (size_t)snprintf(big, cap, "{\"PeersChanged\":[");
+            for (int i = 1; i <= 600; i++) {
+                n += (size_t)snprintf(big + n, cap - n, "%s{\"ID\":%d}", i > 1 ? "," : "", round * 600 + i);
+            }
+            snprintf(big + n, cap - n, "]}");
+            EXPECT(apply(&nm, big, 0) == TSNET_NM_PEERS);
+        }
+        EXPECT(nm.n_peers == MAX);
+        for (size_t i = 1; i < nm.n_peers; i++) {
+            EXPECT(nm.peers[i - 1].id < nm.peers[i].id);
+        }
+        tsnet_netmap_free(&nm);
+        free(big);
+    }
+
     if (failures == 0) {
         printf("tsnet netmap_test: ok\n");
     }

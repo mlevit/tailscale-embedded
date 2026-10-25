@@ -4,6 +4,7 @@
 #include <string.h>
 #include "platform.h"
 #include "zstd.h"
+#include "zstd_errors.h"
 
 static const char KEEP_ALIVE[] = "{\"KeepAlive\":true}"; // justKeepAliveStr
 
@@ -76,6 +77,16 @@ static int grow(uint8_t **buf, size_t *cap, size_t need, size_t max)
     return 0;
 }
 
+// Frees a buffer that grew past TSNET_MAPMSG_KEEP: the next message grows it again.
+static void release(uint8_t **buf, size_t *cap)
+{
+    if (*cap > TSNET_MAPMSG_KEEP) {
+        free(*buf);
+        *buf = NULL;
+        *cap = 0;
+    }
+}
+
 // zstdframe.AppendDecode with MaxDecodedSize: every frame in the message, streamed into a buffer that grows up to the
 // cap. Returns the decoded length, or -1.
 static long decode(tsnet_mapmsg_t *m)
@@ -85,13 +96,17 @@ static long decode(tsnet_mapmsg_t *m)
     size_t out_len = 0, last = 1;
     while (in.pos < in.size || last != 0) {
         if (out_len == m->out_cap && grow(&m->out, &m->out_cap, out_len + 1, TSNET_MAPMSG_DECODED_MAX) != 0) {
-            tsnet_log(TSNET_LOG_WARN, "map message decodes to more than %u bytes", (unsigned)TSNET_MAPMSG_DECODED_MAX);
+            tsnet_log(TSNET_LOG_WARN, "map message over TSNET_MAPMSG_DECODED_MAX (%u bytes decoded): poll ends", (unsigned)TSNET_MAPMSG_DECODED_MAX);
             return -1;
         }
         ZSTD_outBuffer out = {m->out, m->out_cap, out_len};
         last = ZSTD_decompressStream(m->dctx, &out, &in);
         if (ZSTD_isError(last)) {
             tsnet_log(TSNET_LOG_WARN, "map message: zstd: %s", ZSTD_getErrorName(last));
+            if (ZSTD_getErrorCode(last) == ZSTD_error_frameParameter_windowTooLarge) {
+                tsnet_log(TSNET_LOG_WARN, "map message: the zstd window is over TSNET_MAPMSG_WINDOW_LOG (%d)",
+                          TSNET_MAPMSG_WINDOW_LOG);
+            }
             return -1;
         }
         if (out.pos == out_len && in.pos == in.size && last != 0 && out.pos < out.size) {
@@ -142,8 +157,8 @@ int tsnet_mapmsg_feed(tsnet_mapmsg_t *m, const uint8_t *data, size_t len, tsnet_
             m->want = (uint32_t)m->size[0] | (uint32_t)m->size[1] << 8 | (uint32_t)m->size[2] << 16 |
                       (uint32_t)m->size[3] << 24;
             if (m->want > TSNET_MAPMSG_WIRE_MAX) { // before any allocation, as Go checks
-                tsnet_log(TSNET_LOG_WARN, "map message of %u bytes is over %u", (unsigned)m->want,
-                          (unsigned)TSNET_MAPMSG_WIRE_MAX);
+                tsnet_log(TSNET_LOG_WARN, "map message of %u bytes is over TSNET_MAPMSG_WIRE_MAX (%u): poll ends",
+                          (unsigned)m->want, (unsigned)TSNET_MAPMSG_WIRE_MAX);
                 m->dead = true;
                 break;
             }
@@ -164,6 +179,8 @@ int tsnet_mapmsg_feed(tsnet_mapmsg_t *m, const uint8_t *data, size_t len, tsnet_
             if (message(m, fn, ctx) != 0) {
                 m->dead = true;
             }
+            release(&m->msg, &m->cap); // fn has returned: nothing points into the buffers now
+            release(&m->out, &m->out_cap);
         }
     }
     return m->dead ? -1 : 0;

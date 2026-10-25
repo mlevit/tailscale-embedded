@@ -258,6 +258,16 @@ static int count_states(const tsnet_endpoint_t *e)
     return n;
 }
 
+static int find_state(const tsnet_endpoint_t *e, const tsnet_addrq_t *q)
+{
+    for (int i = 0; i < TSNET_EP_STATES; i++) {
+        if (e->st[i].used && e->st[i].port == q->port && memcmp(e->st[i].ip, q->ip, 16) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 // addrForSendLocked's trust window, and what a send starts (endpoint.send): pings to every endpoint not pinged in the
 // last 5 s, a CallMeMaybe with them, and the heartbeat.
 static void send_and_heartbeat(void)
@@ -343,7 +353,8 @@ static void endpoints(void)
     uint8_t tx2[12] = {1};
     EXPECT(!tsnet_endpoint_got_ping(&e, now + SEC, cand.ip, cand.port, tx2));
     // A ping from a netmap endpoint keeps it a netmap one.
-    EXPECT(!tsnet_endpoint_got_ping(&e, now, nm.ip, nm.port, TX));
+    uint8_t tx3[12] = {3};
+    EXPECT(!tsnet_endpoint_got_ping(&e, now, nm.ip, nm.port, tx3));
     EXPECT(e.st[0].last_got_ping == 0);
     // 45 s after its last ping the candidate goes; the netmap one stays while the netmap has it.
     netmap(&e, now + SEC + TSNET_SESSION_ACTIVE_US, &nm, 1);
@@ -367,7 +378,7 @@ static void endpoints(void)
     tsnet_endpoint_call_me_maybe(&e, now + SEC, cmm, 3, &act);
     EXPECT(count_states(&e) == 3);                 // IPv6 link-local is left out
     EXPECT(act.n_ping == 3 && !act.call_me_maybe); // the netmap one again too
-    tsnet_endpoint_call_me_maybe(&e, now + 2 * SEC, cmm + 1, 1, &act);
+    tsnet_endpoint_call_me_maybe(&e, now + 3 * SEC, cmm + 1, 1, &act);
     EXPECT(count_states(&e) == 2 && act.n_ping == 2); // c1 is gone
 
     // reset (a new disco key): no best, nothing in flight, no session.
@@ -375,6 +386,132 @@ static void endpoints(void)
     e.trust_until = now + 100 * SEC;
     tsnet_endpoint_reset(&e);
     EXPECT(!e.best.valid && e.trust_until == 0 && e.last_send_ext == 0 && tsnet_endpoint_next(&e) == e.heartbeat_at);
+}
+
+// #1978: a CallMeMaybe's bad targets get no ping, good ones do, and a burst from one peer is limited.
+static void call_me_maybe_filter(void)
+{
+    uint64_t now = 1000 * SEC;
+    const char *bad[] = {"0.0.0.0:5",    "127.0.0.1:5",        "127.9.9.9:5",  "224.0.0.251:5", "239.255.255.250:5",
+                         "255.255.255.255:5", "169.254.169.254:80", "169.254.1.1:5", "[::]:5",      "[::1]:5",
+                         "[ff02::fb]:5", "[fe80::1]:5",        "198.51.100.1:0"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        tsnet_endpoint_t e;
+        tsnet_endpoint_init(&e);
+        tsnet_addrq_t q = al(bad[i], 0);
+        tsnet_disco_ep_t eps[1] = {ep_of(&q)};
+        tsnet_ep_actions_t act;
+        tsnet_endpoint_call_me_maybe(&e, now, eps, 1, &act);
+        EXPECT(act.n_ping == 0 && count_states(&e) == 0);
+    }
+    // Good ones (LAN, public, IPv6 global) beside a bad one: only the good get pings.
+    tsnet_endpoint_t e;
+    tsnet_endpoint_init(&e);
+    tsnet_addrq_t g1 = al("192.168.1.20:41641", 0), g2 = al("203.0.113.5:9", 0), g3 = al("[2001:db8::1]:7", 0),
+                  b1 = al("127.0.0.1:5", 0);
+    tsnet_disco_ep_t mix[4] = {ep_of(&b1), ep_of(&g1), ep_of(&g2), ep_of(&g3)};
+    tsnet_ep_actions_t act;
+    tsnet_endpoint_call_me_maybe(&e, now, mix, 4, &act);
+    EXPECT(act.n_ping == 3 && count_states(&e) == 3);
+    for (int i = 0; i < act.n_ping; i++) {
+        EXPECT(act.ping[i].port != 5);
+    }
+    // A burst: within 2 s the next one is ignored (no pings, nothing replaced); at 2 s it's handled.
+    tsnet_endpoint_call_me_maybe(&e, now + SEC, mix + 1, 1, &act);
+    EXPECT(act.n_ping == 0 && count_states(&e) == 3);
+    tsnet_endpoint_call_me_maybe(&e, now + TSNET_CMM_MIN_INTERVAL_US, mix + 1, 1, &act);
+    EXPECT(act.n_ping == 1 && count_states(&e) == 1);
+    // The limit is per peer.
+    tsnet_endpoint_t other;
+    tsnet_endpoint_init(&other);
+    tsnet_endpoint_call_me_maybe(&other, now + TSNET_CMM_MIN_INTERVAL_US, mix + 1, 1, &act);
+    EXPECT(act.n_ping == 1);
+}
+
+// #1979: a ping replayed from spoofed sources can't fill the table against the netmap's endpoints or draw pongs.
+static void eviction_and_replay(void)
+{
+    uint64_t now = 1000 * SEC;
+    tsnet_endpoint_t e;
+    tsnet_endpoint_init(&e);
+    // One captured ping, replayed from 16 spoofed sources: the first is answered, the other 15 aren't, and none adds
+    // a candidate beyond the first.
+    uint8_t cap[12] = {0xca, 0xfe};
+    int pongs = 0;
+    for (int i = 0; i < TSNET_EP_STATES; i++) {
+        tsnet_addrq_t q = al("198.51.100.1:1", 0);
+        q.port = (uint16_t)(2000 + i);
+        pongs += !tsnet_endpoint_got_ping(&e, now + (uint64_t)i, q.ip, q.port, cap);
+    }
+    EXPECT(pongs == 1 && count_states(&e) == 1);
+    // Alternating replays of two captured pings: still only the first of each is answered.
+    uint8_t cap2[12] = {0xbe, 0xef};
+    pongs = 0;
+    for (int i = 0; i < 20; i++) {
+        tsnet_addrq_t q = al("198.51.100.2:1", 0);
+        q.port = (uint16_t)(3000 + i);
+        pongs += !tsnet_endpoint_got_ping(&e, now + SEC, q.ip, q.port, i % 2 ? cap : cap2);
+    }
+    EXPECT(pongs == 1);
+    // Normal pings (fresh txids) still get pongs, and fill the table with candidates.
+    tsnet_endpoint_init(&e);
+    pongs = 0;
+    for (int i = 0; i < TSNET_EP_STATES; i++) {
+        tsnet_addrq_t q = al("198.51.100.1:1", 0);
+        q.port = (uint16_t)(2000 + i);
+        uint8_t tx[12] = {1, (uint8_t)i};
+        pongs += !tsnet_endpoint_got_ping(&e, now + (uint64_t)i, q.ip, q.port, tx);
+    }
+    EXPECT(pongs == TSNET_EP_STATES && count_states(&e) == TSNET_EP_STATES);
+    // The txid ring is bounded: a ping older than TSNET_GOT_TXIDS others is forgotten.
+    uint8_t old[12] = {1, 0}; // the first of those above
+    for (int i = 0; i < TSNET_GOT_TXIDS; i++) {
+        uint8_t tx[12] = {2, (uint8_t)i};
+        tsnet_endpoint_got_ping(&e, now + 20 * SEC, al("198.51.100.1:1", 0).ip, 2000, tx);
+    }
+    EXPECT(!tsnet_endpoint_got_ping(&e, now + 20 * SEC, al("198.51.100.1:1", 0).ip, 2000, old));
+
+    // Full of candidates: a new candidate finds no room, but a netmap endpoint evicts the oldest candidate.
+    tsnet_endpoint_init(&e);
+    for (int i = 0; i < TSNET_EP_STATES; i++) {
+        tsnet_addrq_t q = al("198.51.100.1:1", 0);
+        q.port = (uint16_t)(2000 + i);
+        uint8_t tx[12] = {1, (uint8_t)i};
+        tsnet_endpoint_got_ping(&e, now + (uint64_t)i, q.ip, q.port, tx);
+    }
+    uint8_t txn[12] = {7};
+    tsnet_addrq_t extra = al("198.51.100.3:9", 0);
+    tsnet_endpoint_got_ping(&e, now + SEC, extra.ip, extra.port, txn);
+    EXPECT(count_states(&e) == TSNET_EP_STATES && find_state(&e, &extra) < 0);
+    tsnet_addrq_t nm = al("192.0.2.1:7", 0), nm2 = al("192.0.2.2:7", 0);
+    tsnet_addrq_t both[2] = {nm, nm2};
+    netmap(&e, now + 2 * SEC, both, 2);
+    EXPECT(find_state(&e, &nm) >= 0 && find_state(&e, &nm2) >= 0 && count_states(&e) == TSNET_EP_STATES);
+    tsnet_addrq_t oldest = al("198.51.100.1:2000", 0), oldest2 = al("198.51.100.1:2001", 0),
+                  third = al("198.51.100.1:2002", 0);
+    EXPECT(find_state(&e, &oldest) < 0 && find_state(&e, &oldest2) < 0 && find_state(&e, &third) >= 0);
+    // A netmap endpoint is never evicted by later candidates' pings or another netmap.
+    netmap(&e, now + 3 * SEC, both, 2);
+    EXPECT(find_state(&e, &nm) >= 0 && find_state(&e, &nm2) >= 0);
+    // A CallMeMaybe endpoint evicts a candidate too.
+    tsnet_addrq_t c1 = al("203.0.113.1:1", 0);
+    tsnet_disco_ep_t cmm[1] = {ep_of(&c1)};
+    tsnet_ep_actions_t act;
+    tsnet_endpoint_call_me_maybe(&e, now + 4 * SEC, cmm, 1, &act);
+    EXPECT(find_state(&e, &c1) >= 0 && find_state(&e, &third) < 0);
+    // Only candidates are evicted: a table of netmap endpoints refuses another.
+    tsnet_endpoint_init(&e);
+    tsnet_addrq_t full[TSNET_EP_STATES + 1];
+    for (int i = 0; i < TSNET_EP_STATES + 1; i++) {
+        full[i] = al("192.0.2.1:1", 0);
+        full[i].port = (uint16_t)(100 + i);
+    }
+    tsnet_disco_ep_t many[TSNET_EP_STATES + 1];
+    for (int i = 0; i < TSNET_EP_STATES + 1; i++) {
+        many[i] = ep_of(&full[i]);
+    }
+    tsnet_endpoint_set_netmap(&e, now, many, TSNET_EP_STATES + 1);
+    EXPECT(count_states(&e) == TSNET_EP_STATES);
 }
 
 // The caps: more candidates than TSNET_EP_STATES are dropped while the others are live; more pings than
@@ -474,6 +611,8 @@ int main(void)
     send_and_heartbeat();
     want_full_ping();
     endpoints();
+    call_me_maybe_filter();
+    eviction_and_replay();
     caps();
     cli_ping();
     if (failures == 0) {

@@ -129,10 +129,12 @@ static void prune(tsnet_endpoint_t *e, uint64_t now)
     }
 }
 
-// A new endpoint state for ip:port, pruning first if full. -1 if there's still no room.
-static int add(tsnet_endpoint_t *e, uint64_t now, const uint8_t ip[16], uint16_t port)
+// A new endpoint state for ip:port, pruning first if full. With `evict` (a netmap or CallMeMaybe endpoint) a
+// full table then drops its oldest ping-learned candidate: a peer's pings from spoofed addresses can't fill the table
+// and keep the real endpoints out (Go's map holds 100 and always admits the netmap's). -1 if there's still no room.
+static int add(tsnet_endpoint_t *e, uint64_t now, const uint8_t ip[16], uint16_t port, bool evict)
 {
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
         for (int i = 0; i < TSNET_EP_STATES; i++) {
             if (!e->st[i].used) {
                 e->st[i].used = true;
@@ -141,7 +143,24 @@ static int add(tsnet_endpoint_t *e, uint64_t now, const uint8_t ip[16], uint16_t
                 return i;
             }
         }
-        prune(e, now);
+        if (pass == 0) {
+            prune(e, now);
+        } else if (evict) {
+            int victim = -1;
+            for (int i = 0; i < TSNET_EP_STATES; i++) {
+                const tsnet_epstate_t *st = &e->st[i];
+                if (st->last_got_ping != 0 && !st->in_netmap && st->call_me_maybe == 0 &&
+                    (victim < 0 || st->last_got_ping < e->st[victim].last_got_ping)) {
+                    victim = i;
+                }
+            }
+            if (victim < 0) {
+                return -1;
+            }
+            delete_at(e, victim);
+        } else {
+            break;
+        }
     }
     return -1;
 }
@@ -151,10 +170,17 @@ void tsnet_endpoint_set_netmap(tsnet_endpoint_t *e, uint64_t now, const tsnet_di
     for (int i = 0; i < TSNET_EP_STATES; i++) {
         e->st[i].in_netmap = false; // assume deleted until seen below
     }
+    // First the ones already here, so making room for a new one never evicts one the netmap still lists.
+    for (size_t k = 0; k < n; k++) {
+        int i = find(e, eps[k].ip, eps[k].port);
+        if (i >= 0) {
+            e->st[i].in_netmap = true;
+        }
+    }
     for (size_t k = 0; k < n; k++) {
         int i = find(e, eps[k].ip, eps[k].port);
         if (i < 0) {
-            i = add(e, now, eps[k].ip, eps[k].port);
+            i = add(e, now, eps[k].ip, eps[k].port, true);
         }
         if (i >= 0) {
             e->st[i].in_netmap = true;
@@ -299,22 +325,28 @@ void tsnet_endpoint_send(tsnet_endpoint_t *e, uint64_t now, tsnet_addrq_t *udp, 
 bool tsnet_endpoint_got_ping(tsnet_endpoint_t *e, uint64_t now, const uint8_t ip[16], uint16_t port,
                              const uint8_t txid[12])
 {
+    // A txid seen before is a replay, from any address: no pong, and it doesn't refresh or add an endpoint.
+    // Go remembers one txid per endpoint, so a captured ping replayed from alternating addresses drew a pong each time.
+    for (int k = 0; k < e->got_tx_n; k++) {
+        if (memcmp(e->got_tx[k], txid, 12) == 0) {
+            return true;
+        }
+    }
+    memcpy(e->got_tx[e->got_tx_next], txid, 12);
+    e->got_tx_next = (e->got_tx_next + 1) % TSNET_GOT_TXIDS;
+    if (e->got_tx_n < TSNET_GOT_TXIDS) {
+        e->got_tx_n++;
+    }
     int i = find(e, ip, port);
     if (i >= 0) {
-        tsnet_epstate_t *st = &e->st[i];
-        bool dup = memcmp(st->last_got_ping_tx, txid, 12) == 0;
-        if (!dup) {
-            memcpy(st->last_got_ping_tx, txid, 12);
+        if (e->st[i].last_got_ping != 0) {
+            e->st[i].last_got_ping = now; // a netmap endpoint stays one
         }
-        if (st->last_got_ping != 0) {
-            st->last_got_ping = now; // a netmap endpoint stays one
-        }
-        return dup;
+        return false;
     }
-    i = add(e, now, ip, port); // a new candidate
+    i = add(e, now, ip, port, false); // a new candidate: waits for room, never evicts
     if (i >= 0) {
         e->st[i].last_got_ping = now;
-        memcpy(e->st[i].last_got_ping_tx, txid, 12);
     }
     return false;
 }
@@ -368,18 +400,40 @@ bool tsnet_endpoint_pong(tsnet_endpoint_t *e, uint64_t now, const uint8_t txid[1
     return true;
 }
 
+// Whether a CallMeMaybe may name this address. Divergence from Go: Go drops only IPv6 link-local, so any peer
+// could aim our pings at loopback, multicast, broadcast or 169.254.169.254. LAN and public addresses stay: a direct
+// path over the LAN is the normal case.
+static bool cmm_target_ok(const tsnet_disco_ep_t *ep)
+{
+    static const uint8_t ZERO[16] = {0};
+    if (ep->port == 0 || memcmp(ep->ip, ZERO, 16) == 0 || tsnet_ip_loopback(ep->ip) || tsnet_ip_link_local(ep->ip)) {
+        return false;
+    }
+    if (!tsnet_ip_is6(ep->ip)) {
+        // 0.0.0.0/8 is "this network", 224.0.0.0/4 is multicast, 240.0.0.0/4 holds 255.255.255.255 (and is reserved).
+        return ep->ip[12] != 0 && ep->ip[12] < 224;
+    }
+    return ep->ip[0] != 0xff; // ff00::/8
+}
+
 void tsnet_endpoint_call_me_maybe(tsnet_endpoint_t *e, uint64_t now, const tsnet_disco_ep_t *eps, size_t n,
                                   tsnet_ep_actions_t *a)
 {
     memset(a, 0, sizeof *a);
+    // At most one per peer per 2 s. A peer sends one when its pings go unanswered, at most once per 3 s
+    // heartbeat, so this never delays a real path upgrade, but it caps a hostile peer at 16 pings per 2 s.
+    if (e->last_cmm != 0 && now - e->last_cmm < TSNET_CMM_MIN_INTERVAL_US) {
+        return;
+    }
+    e->last_cmm = now;
     bool want[TSNET_EP_STATES] = {false};
     for (size_t k = 0; k < n; k++) {
-        if (tsnet_ip_is6(eps[k].ip) && tsnet_ip_link_local(eps[k].ip)) {
-            continue; // sent but ignored for now, as Go does
+        if (!cmm_target_ok(&eps[k])) {
+            continue;
         }
         int i = find(e, eps[k].ip, eps[k].port);
         if (i < 0) {
-            i = add(e, now, eps[k].ip, eps[k].port);
+            i = add(e, now, eps[k].ip, eps[k].port, true);
         }
         if (i >= 0) {
             e->st[i].call_me_maybe = now;

@@ -9,6 +9,11 @@
 #include <stdint.h>
 #include "tailcfg.h"
 
+// The most peers a netmap keeps, and the most nodes one message's Peers or PeersChanged list is decoded for. A
+// node is about 0.7 KB with its arrays, so 1,024 peers is under 1 MB of the device's PSRAM, and a home tailnet is a few
+// hundred nodes at most.
+#define TSNET_NETMAP_PEERS_MAX 1024
+
 typedef struct {
     int64_t id;
     char stable_id[64];

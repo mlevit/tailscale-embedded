@@ -6,13 +6,17 @@
 // Limits, smaller than Go's for the device (Go: 256 MB a message on the wire, 1 GB decoded): a message over
 // TSNET_MAPMSG_WIRE_MAX or decoding past TSNET_MAPMSG_DECODED_MAX is an error, checked before allocating. The zstd window
 // is capped at TSNET_MAPMSG_WINDOW_LOG (Tailscale's zstdframe writes single-segment frames, whose window is the message).
+// A message's buffers over TSNET_MAPMSG_KEEP are freed once it is handled, so one big netmap doesn't hold its memory
+// for the rest of the poll.
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define TSNET_MAPMSG_WIRE_MAX (4u << 20)
-#define TSNET_MAPMSG_DECODED_MAX (8u << 20)
-#define TSNET_MAPMSG_WINDOW_LOG 23 // 8 MB, the decoded cap
+// A real netmap is about 1.5 KB of JSON a peer, so these hold a tailnet of well over a thousand nodes.
+#define TSNET_MAPMSG_WIRE_MAX (2u << 20)    // zstd shrinks a netmap 5 to 10 times, so 2 MB covers the decoded cap
+#define TSNET_MAPMSG_DECODED_MAX (4u << 20) // 4 MB of JSON: about 2,500 peers, twice TSNET_NETMAP_PEERS_MAX
+#define TSNET_MAPMSG_WINDOW_LOG 22          // 4 MB, the decoded cap
+#define TSNET_MAPMSG_KEEP (64u << 10)       // a buffer past 64 KB is freed after its message, not held between messages
 
 typedef struct tsnet_mapmsg tsnet_mapmsg_t;
 
